@@ -51,7 +51,7 @@ try:
     import uvicorn
     from fastapi import Depends, FastAPI, HTTPException, Request, Response
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -176,6 +176,13 @@ from headroom.transforms import (
 
 AnyLLMBackend: Any = None
 LiteLLMBackend: Any = None
+
+HEADROOM_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="12" fill="#0f172a"/>
+<path d="M16 43V21h6v8h20v-8h6v22h-6v-9H22v9z" fill="#22d3ee"/>
+<circle cx="50" cy="14" r="5" fill="#34d399"/>
+</svg>
+"""
 
 fcntl: Any = None
 try:
@@ -2010,6 +2017,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload = warmup_registry.to_dict() if warmup_registry is not None else {}
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard_root():
+        """Send bare-root browser hits to the local Headroom dashboard."""
+        return RedirectResponse(url="/dashboard", status_code=307)
+
+    @app.get("/favicon.svg", include_in_schema=False)
+    async def favicon_svg():
+        """Serve the local Headroom browser tab icon."""
+        return Response(
+            content=HEADROOM_FAVICON_SVG,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon_ico():
+        """Serve a favicon for browsers that request the legacy .ico path."""
+        return Response(
+            content=HEADROOM_FAVICON_SVG,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():

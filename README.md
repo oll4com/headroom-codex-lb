@@ -10,6 +10,9 @@
 
 <p align="center"><strong>60–95% fewer tokens · library · proxy · MCP · 6 algorithms · local-first · reversible</strong></p>
 
+> Public OLL4 mirror of the upstream Headroom project: [`chopratejas/headroom`](https://github.com/chopratejas/headroom).
+> This repository carries only the public-safe OLL4 UI patches and keeps upstream-compatible history for future syncs.
+
 <p align="center">
   <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml"><img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://app.codecov.io/gh/chopratejas/headroom"><img src="https://codecov.io/gh/chopratejas/headroom/graph/badge.svg" alt="codecov"></a>
