@@ -12,6 +12,7 @@
 
 > Public OLL4 mirror of the upstream Headroom project: [`chopratejas/headroom`](https://github.com/chopratejas/headroom).
 > This repository carries only the public-safe OLL4 UI patches and keeps upstream-compatible history for future syncs.
+> Public mirror maintenance commits on this repository are authored from the [`oll4com`](https://github.com/oll4com) GitHub account.
 
 <p align="center">
   <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml"><img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
