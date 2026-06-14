@@ -1020,11 +1020,18 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
     assert "config-file: .release-please-config.json" in content
     assert "manifest-file: .release-please-manifest.json" in content
+    assert "issues: write" in content, (
+        "Bot needs issues write to manage release labels/metadata cleanly."
+    )
     assert "pull-requests: write" in content, (
         "Bot needs write permission to open/update its release PR."
     )
     assert "contents: write" in content, (
         "Bot needs contents write to tag the release commit on merge."
+    )
+    assert "secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN" in content, (
+        "Bot should prefer a dedicated release token when configured and "
+        "fall back to GITHUB_TOKEN otherwise."
     )
 
 
