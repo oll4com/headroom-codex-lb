@@ -14,6 +14,12 @@
 > This repository carries only the public-safe OLL4 UI patches and keeps upstream-compatible history for future syncs.
 > Public mirror maintenance commits on this repository are authored from the [`oll4com`](https://github.com/oll4com) GitHub account.
 
+## What OLL4 changes in this mirror
+
+- keeps the upstream repository and release train explicit instead of presenting this mirror as the canonical source
+- carries only public-safe OLL4-facing polish, attribution, and mirror-maintenance changes
+- preserves the upstream project license, docs links, and contribution path back to `chopratejas/headroom`
+
 <p align="center">
   <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml"><img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://app.codecov.io/gh/chopratejas/headroom"><img src="https://codecov.io/gh/chopratejas/headroom/graph/badge.svg" alt="codecov"></a>
