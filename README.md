@@ -23,3 +23,13 @@ For the standard package, use `python -m pip install "headroom-ai[proxy]==0.37.0
 That installs the upstream package; this repository carries additional UI source changes. Build from this checkout only if you need those changes, following the upstream development instructions. OLL4 does not publish a separate PyPI or npm package from this repository.
 
 Compression depends on the workload and settings. Provider prefix-cache discounts are separate from removed tokens. No fixed savings percentage is guaranteed, and this mirror does not contain production credentials or a ready-made private gateway deployment.
+
+## Mirror Pull Requests
+
+The mirror keeps three required GitHub check names:
+
+- `changes`: compile the Python source, verify attribution files, check the actual change range for whitespace errors, and reject manual edits to the upstream-generated `CHANGELOG.md` on PRs. Use `OLL4_CHANGELOG.md` for mirror release notes.
+- `commitlint`: validate PR commits against the existing Conventional Commit configuration.
+- `label`: validate the current PR title, template, behavior proof and review readiness with the base branch's governance script. Suggested labels appear in the job summary; the workflow does not modify labels or post comments. The upstream exemption for bot-authored PR templates remains in place.
+
+Checks rerun when PR metadata changes. Workflow permissions are read-only, and no package publishing or model downloads run. These are lightweight mirror checks, not the full upstream runtime test suite. Follow the PR template and include relevant test evidence for source changes. Merging also requires one approving review under the existing branch protection.
