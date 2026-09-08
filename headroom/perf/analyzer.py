@@ -11,9 +11,11 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import resolve_litellm_model
@@ -21,6 +23,7 @@ from headroom.pricing.litellm_pricing import resolve_litellm_model
 log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
+DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -45,6 +48,11 @@ _PIPELINE_RE = re.compile(
 _TOIN_RE = re.compile(
     r"TOIN: (?P<patterns>\d+) patterns, (?P<compressions>\d+) compressions, "
     r"(?P<retrievals>\d+) retrievals, (?P<rate>[\d.]+)% retrieval rate"
+)
+
+# Matches structured stage timing logs: [hr_...] STAGE_TIMINGS {"event": "stage_timings", ...}
+_STAGE_TIMINGS_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) .* \[(?P<rid>[^\]]+)\] STAGE_TIMINGS (?P<payload>.+)$"
 )
 
 
@@ -127,6 +135,16 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     return result
 
 
+def _decode_perf_savings(value: str) -> list[dict[str, object]]:
+    # Local import keeps the analyzer usable against old logs/install layouts.
+    try:
+        from headroom.proxy.savings_attribution import decode
+
+        return decode(value)
+    except Exception:
+        return []
+
+
 @dataclass
 class PerfRecord:
     """A single parsed PERF log entry."""
@@ -134,16 +152,33 @@ class PerfRecord:
     timestamp: str
     request_id: str
     model: str = ""
+    client: str = ""
     num_messages: int = 0
     tokens_before: int = 0
     tokens_after: int = 0
     tokens_saved: int = 0
+    # Tokens the forwarded request GREW by (PERF ``tok_inflated``). Both
+    # endpoints are clamped — ``tok_saved`` at zero and ``tok_inflated`` at zero
+    # — so a turn that left the proxy bigger reports ``tok_saved=0`` and hides
+    # its growth in a field nothing downstream read. Carrying it here is what
+    # lets the report state net alongside gross instead of implying they agree.
+    tokens_inflated: int = 0
+    tool_saved: int = 0
     cache_read: int = 0
     cache_write: int = 0
     cache_hit_pct: int = 0
     optimization_ms: float = 0
     transforms: list[str] = field(default_factory=list)
-    client: str = ""
+    total_ms: float = 0.0
+    tokens_out: int = 0
+    ttfb_ms: float = 0.0
+    stages: dict[str, float] = field(default_factory=dict)
+    savings_breakdown: list[dict[str, object]] = field(default_factory=list)
+    # True when the proxy answered from its own response cache and never
+    # contacted the upstream. Such a turn has all-zero token counters and no
+    # upstream stage timings, so without this flag it reads as a turn that
+    # did nothing (#3019). Absent from pre-#3019 logs, hence the default.
+    from_response_cache: bool = False
 
 
 @dataclass
@@ -190,6 +225,10 @@ class PerfReport:
     transform_records: list[TransformRecord] = field(default_factory=list)
     toin_records: list[ToinRecord] = field(default_factory=list)
     log_files_read: int = 0
+    # Rotated files skipped unopened because they were last written before the
+    # requested window. Reported so coverage stays honest: `log_files_read` on
+    # its own would silently understate how much log exists on disk.
+    log_files_skipped: int = 0
     total_lines_parsed: int = 0
     # Window covered by the report. `requested_hours` is what the caller
     # asked for; `oldest_kept_ts` / `newest_kept_ts` are the actual
@@ -200,6 +239,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -233,12 +276,23 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     """
     report = PerfReport()
     report.requested_hours = last_n_hours
+    stages_by_rid: dict[str, dict[str, float]] = {}
 
-    log_dir = _paths.log_dir()
+    log_dir = _paths.log_dir() if os.environ.get("HEADROOM_WORKSPACE_DIR") else LOG_DIR
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -259,7 +313,31 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
-    log_files = sorted(log_dir.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
+    #
+    # A rotated file last written before the cutoff cannot contain a record
+    # inside the window, so skip it without opening it. Without this the cost
+    # of a windowed query is O(total log history) rather than O(window):
+    # `/stats` recomputes throughput over the last hour on a 10s cache TTL, so
+    # a dashboard polling it re-read and re-regexed every byte of every
+    # rotated log, forever, for an answer that lives in the tail of the newest
+    # file. Measured on a developer machine with six rotations (54 MB).
+    #
+    # mtime is the safe discriminator: the logs are append-only, so a file
+    # untouched since before the cutoff has no line written after it. Files
+    # are stat'd once and the value reused for the sort.
+    cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
+    dated_files: list[tuple[float, Path]] = []
+    for path in log_dir.glob("proxy.log*"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            # Rotated away between glob and stat — nothing to read.
+            continue
+        if cutoff_epoch is not None and mtime < cutoff_epoch:
+            report.log_files_skipped += 1
+            continue
+        dated_files.append((mtime, path))
+    log_files = [path for _, path in sorted(dated_files, key=lambda pair: pair[0])]
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -268,6 +346,27 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                 for line in f:
                     report.total_lines_parsed += 1
                     line = line.rstrip()
+
+                    # STAGE_TIMINGS lines
+                    m_stage = _STAGE_TIMINGS_RE.match(line)
+                    if m_stage:
+                        ts = m_stage.group("ts")
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
+                        rid = m_stage.group("rid")
+                        try:
+                            import json
+
+                            payload = json.loads(m_stage.group("payload"))
+                            stages = payload.get("stages", {})
+                            stages_by_rid[rid] = {
+                                k: float(v) for k, v in stages.items() if v is not None
+                            }
+                        except Exception:
+                            pass
+                        continue
 
                     # PERF lines (richest data)
                     m = _PERF_RE.match(line)
@@ -299,16 +398,24 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
+                                client=kv.get("client", ""),
                                 num_messages=int(kv.get("msgs", 0)),
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
+                                tokens_inflated=int(kv.get("tok_inflated", 0)),
+                                tool_saved=int(kv.get("tool_saved", 0)),
+                                savings_breakdown=_decode_perf_savings(kv.get("savings", "none")),
                                 cache_read=int(kv.get("cache_read", 0)),
                                 cache_write=int(kv.get("cache_write", 0)),
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
                                 optimization_ms=float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
-                                client=kv.get("client", ""),
+                                total_ms=float(kv.get("total_ms", 0)),
+                                tokens_out=int(kv.get("tok_out", 0)),
+                                ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                from_response_cache=kv.get("cached", "0") == "1",
+                                stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
                         continue
@@ -405,14 +512,15 @@ def format_report(report: PerfReport) -> str:
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(
@@ -428,11 +536,39 @@ def format_report(report: PerfReport) -> str:
         total_before = sum(r.tokens_before for r in records)
         total_after = sum(r.tokens_after for r in records)
         total_saved = sum(r.tokens_saved for r in records)
+        total_tool_saved = sum(r.tool_saved for r in records)
+        total_headline_saved = total_saved + total_tool_saved
         pct = (total_saved / total_before * 100) if total_before > 0 else 0
+        # All-layers denominator: deferred tool schemas were never in tok_before (they
+        # don't reach count_messages), so the pre-Headroom world is tok_before + them.
+        # Same construction the proxy's /api/stats uses for total_before_compression —
+        # the headline number and the headline percent must share a numerator, or the
+        # tile reads "60,920 saved (0.1%)" off two different definitions of saved.
+        headline_before = total_before + total_tool_saved
+        headline_pct = (total_headline_saved / headline_before * 100) if headline_before > 0 else 0
 
         lines.append(f"Requests:     {len(records)}")
-        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% reduction)")
-        lines.append(f"Total saved:  {total_saved:,} tokens")
+        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% messages)")
+        # ONE headline. Tool-schema deferral can't move tok_before/after (messages never
+        # include tool bytes), so it used to render as a rival "Tool saved" line — which
+        # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
+        lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
+        # Gross vs net. ``tok_saved`` is clamped at zero per request, so turns
+        # where Headroom made the body BIGGER (CCR proactive expansion, memory
+        # injection) contribute nothing negative to the headline — their growth
+        # lands in ``tok_inflated`` instead, which nothing here used to read.
+        # Printing "321,239,562 -> 313,274,727" directly above "8,455,763 saved"
+        # implies the two reconcile; they differ by exactly the inflation. Show
+        # it whenever it is non-zero so the arithmetic closes on the page.
+        total_inflated = sum(r.tokens_inflated for r in records)
+        if total_inflated > 0:
+            lines.append(
+                f"  · inflated      {total_inflated:,} "
+                f"(net message reduction {total_before - total_after:,})"
+            )
+        if total_tool_saved > 0:
+            lines.append(f"  · messages       {max(0, total_saved):,}")
+            lines.append(f"  · tool schemas   {total_tool_saved:,}")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -443,19 +579,37 @@ def format_report(report: PerfReport) -> str:
         lines.append("Per-Model Breakdown")
         lines.append("-" * 40)
         for model, model_recs in sorted(by_model.items()):
+            # Same all-layers construction as the headline above. This loop used to
+            # sum ``tokens_saved`` alone, so every row reported message compression
+            # only while the headline it sat under counted deferral too. The rows
+            # then failed to add up to the total printed inches above them — in the
+            # report that prompted this, four rows summing to 36,071 under a
+            # headline of 625,277, because 589,206 tokens of tool-schema deferral
+            # had no row to land in. A tool-heavy model read "0 tokens saved".
             m_saved = sum(r.tokens_saved for r in model_recs)
+            m_tool_saved = sum(r.tool_saved for r in model_recs)
+            m_headline_saved = m_saved + m_tool_saved
             m_before = sum(r.tokens_before for r in model_recs)
-            m_pct = (m_saved / m_before * 100) if m_before > 0 else 0
+            m_headline_before = m_before + m_tool_saved
+            m_pct = (m_headline_saved / m_headline_before * 100) if m_headline_before > 0 else 0
             list_price = _get_list_price(model)
             price_str = f"${list_price:.2f}/MTok" if list_price else "unknown"
             est_str = (
-                f"  ~${m_saved * list_price / 1_000_000:.2f} at list price" if list_price else ""
+                f"  ~${m_headline_saved * list_price / 1_000_000:.2f} at list price"
+                if list_price
+                else ""
             )
             lines.append(
                 f"  {model}: {len(model_recs)} reqs, "
-                f"{m_saved:,} tokens saved ({m_pct:.0f}%), "
+                f"{m_headline_saved:,} tokens saved ({m_pct:.0f}%), "
                 f"list price {price_str}{est_str}"
             )
+            # Only split the row when there is a split to show; a compression-only
+            # model keeps the single-line shape it has always had.
+            if m_tool_saved > 0:
+                lines.append(
+                    f"      · messages {max(0, m_saved):,}  · tool schemas {m_tool_saved:,}"
+                )
         lines.append("  * Actual bill savings depend on provider caching behavior")
         lines.append("")
 
@@ -500,15 +654,62 @@ def format_report(report: PerfReport) -> str:
         # Optimization latency
         opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
         if opt_times:
-            avg_opt = sum(opt_times) / len(opt_times)
-            max_opt = max(opt_times)
+            overhead = build_overhead_summary(report)
+            opt_stats = overhead["optimization_ms"]
             lines.append("Optimization Overhead")
             lines.append("-" * 40)
-            lines.append(f"  Average:  {avg_opt:.0f}ms")
-            lines.append(f"  Max:      {max_opt:.0f}ms")
-            slow = [t for t in opt_times if t > 500]
-            if slow:
-                lines.append(f"  >500ms:   {len(slow)} requests")
+            lines.append(f"  Average:     {opt_stats['average_ms']:.0f}ms")
+            lines.append(
+                "  p50/p95/p99: "
+                f"{opt_stats['p50_ms']:.0f} / "
+                f"{opt_stats['p95_ms']:.0f} / "
+                f"{opt_stats['p99_ms']:.0f}ms"
+            )
+            lines.append(f"  Max:         {opt_stats['max_ms']:.0f}ms")
+            if opt_stats["slow_request_count"]:
+                lines.append(
+                    f"  >{overhead['slow_threshold_ms']:.0f}ms:      "
+                    f"{opt_stats['slow_request_count']} requests "
+                    f"({opt_stats['slow_request_pct']:.1f}%)"
+                )
+            if overhead["stage_breakdown"]:
+                lines.append("  Slowest stages:")
+                for stage in overhead["stage_breakdown"][:3]:
+                    lines.append(
+                        f"    {stage['stage']}: total {stage['total_ms']:.0f}ms, "
+                        f"p95 {stage['p95_ms']:.0f}ms, max {stage['max_ms']:.0f}ms"
+                    )
+            lines.append("")
+
+        # Throughput
+        tp = calculate_throughput(report)
+        rolling = tp["rolling"]
+        current = tp["current"]
+        if rolling["input_wall_clock"] > 0 or rolling["input_active_p50"] > 0:
+            lines.append("Throughput")
+            lines.append("-" * 40)
+            lines.append(
+                f"  Input (wall-clock):   {rolling['input_wall_clock']:.1f} tok/s"
+                f" (current: {current['input_wall_clock']:.1f} tok/s)"
+            )
+            lines.append(
+                f"  Input (active p50/95): {rolling['input_active_p50']:.1f} / {rolling['input_active_p95']:.1f} tok/s"
+                f" (current: {current['input_active_p50']:.1f} / {current['input_active_p95']:.1f} tok/s)"
+            )
+            if rolling["compression_p50"] > 0:
+                lines.append(
+                    f"  Compression (p50/95):  {rolling['compression_p50']:.1f} / {rolling['compression_p95']:.1f} tok/s"
+                    f" (current: {current['compression_p50']:.1f} / {current['compression_p95']:.1f} tok/s)"
+                )
+            lines.append(
+                f"  Forward (p50/95):      {rolling['forward_p50']:.1f} / {rolling['forward_p95']:.1f} tok/s"
+                f" (current: {current['forward_p50']:.1f} / {current['forward_p95']:.1f} tok/s)"
+            )
+            if rolling["generation_p50"] > 0:
+                lines.append(
+                    f"  Generation (p50/95):   {rolling['generation_p50']:.1f} / {rolling['generation_p95']:.1f} tok/s"
+                    f" (current: {current['generation_p50']:.1f} / {current['generation_p95']:.1f} tok/s)"
+                )
             lines.append("")
 
         # Conversation size distribution
@@ -535,6 +736,31 @@ def format_report(report: PerfReport) -> str:
             lines.append(
                 f"  {name}: {avg_pct:.1f}% avg reduction, {len(recs)} uses, {total_s:,} saved"
             )
+        # This table is built ONLY from "Transform NAME: B -> A tokens (saved N)"
+        # lines, which just one engine emits (transforms/pipeline.py). The
+        # OpenAI-Responses engine (transforms/compression_units.py +
+        # compression_batches.py) applies the same strategies and contains no
+        # logging calls at all, so none of its work appears above. On real
+        # traffic that hid ~7M of ~8.5M message-token savings — the table read
+        # "content_router: 189,783 saved" against a PERF total 44x larger, which
+        # invites exactly the wrong conclusion about which compressors work.
+        #
+        # State the divergence, NOT a coverage ratio. The two totals are
+        # different populations and neither strictly contains the other: the
+        # Transform lines carry no request_id, fire once per pipeline STAGE (so
+        # several can describe one request), and are emitted before the forwarder
+        # decides anything — a mutation later discarded by the signed-thinking
+        # byte-lock still logs its "saved" here while the request's PERF line
+        # correctly reports 0. So "table covers X of Y" would be a false subset
+        # claim in both directions; report the two sums and let the reader judge.
+        table_total = sum(r.tokens_saved for r in report.transform_records)
+        perf_total = sum(r.tokens_saved for r in report.perf_records)
+        if table_total != perf_total:
+            lines.append(
+                f"  ! stage-level total {table_total:,} != PERF message total {perf_total:,} "
+                "— this table sees only engines that emit a Transform line, counts "
+                "per stage, and does not check whether the mutation shipped"
+            )
         lines.append("")
 
     # Router routing breakdown
@@ -554,10 +780,23 @@ def format_report(report: PerfReport) -> str:
                 f"  Excluded:    {total_excluded} ({total_excluded / total_all * 100:.0f}%) — Read/Glob outputs"
             )
             lines.append(
-                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — <50 words"
+                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — below size floor"
             )
             lines.append(
                 f"  Unchanged:   {total_unchanged} ({total_unchanged / total_all * 100:.0f}%) — ratio too high"
+            )
+            # These four buckets are NOT the router's full outcome space — the
+            # `[router] route_counts=` line carries 17 keys, and the ones omitted
+            # here (cache_hit, system_msg, error_protected, already_compressed,
+            # …) are individually larger than "Excluded". Percentages taken over
+            # this subset therefore overstate every share: on real traffic the
+            # "skipped" bucket read 77% here against 49.5% of actual terminal
+            # fates, which reads as a mis-set threshold rather than a narrow
+            # denominator. Say what the denominator is instead of implying it is
+            # everything.
+            lines.append(
+                f"  (shares are of these 4 buckets only, n={total_all}; "
+                "see `[router] route_counts=` for the full outcome space)"
             )
         if total_excluded > total_compressed * 3:
             lines.append("  ! Excluded tools dominate — consider compressing stale Read outputs")
@@ -626,17 +865,241 @@ PERF_RECORD_FIELDS = [
     "tokens_before",
     "tokens_after",
     "tokens_saved",
+    "tool_saved",
     "cache_read",
     "cache_write",
     "cache_hit_pct",
     "optimization_ms",
     "transforms",
+    "total_ms",
+    "tokens_out",
+    "ttfb_ms",
+    "stages",
+    "savings_breakdown",
+    # Appended last so every existing CSV column keeps its position; a reader
+    # that indexes by name is unaffected either way.
+    "from_response_cache",
+    "tokens_inflated",
 ]
 
 
 def _pct(saved: int, before: int) -> float:
     """Reduction percentage, rounded to 1dp, guarding divide-by-zero."""
     return round(saved / before * 100, 1) if before > 0 else 0.0
+
+
+def _percentile(data: list[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    index = (len(sorted_data) - 1) * pct
+    lower = int(index)
+    upper = lower + 1
+    weight = index - lower
+    if upper < len(sorted_data):
+        return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+    return sorted_data[lower]
+
+
+def _latency_stats(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "average_ms": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "max_ms": 0.0,
+        }
+    return {
+        "count": len(values),
+        "average_ms": round(sum(values) / len(values), 2),
+        "p50_ms": round(_percentile(values, 0.50), 2),
+        "p95_ms": round(_percentile(values, 0.95), 2),
+        "p99_ms": round(_percentile(values, 0.99), 2),
+        "max_ms": round(max(values), 2),
+    }
+
+
+def _slowest_stage(record: PerfRecord) -> tuple[str | None, float]:
+    stages = [(name, value) for name, value in record.stages.items() if value > 0]
+    if not stages:
+        return None, 0.0
+    return max(stages, key=lambda item: item[1])
+
+
+def build_overhead_summary(
+    report: PerfReport,
+    *,
+    slow_threshold_ms: float = DEFAULT_SLOW_OPTIMIZATION_MS,
+    limit: int = 10,
+) -> dict:
+    """Aggregate optimization latency and stage-level bottlenecks."""
+    records = report.perf_records
+    opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
+    total_times = [r.total_ms for r in records if r.total_ms > 0]
+    slow_records = [r for r in records if r.optimization_ms > slow_threshold_ms]
+
+    stage_values: dict[str, list[float]] = {}
+    for record in records:
+        for stage, value in record.stages.items():
+            if value > 0:
+                stage_values.setdefault(stage, []).append(value)
+
+    stage_breakdown = []
+    for stage, values in stage_values.items():
+        stats = _latency_stats(values)
+        stage_breakdown.append(
+            {
+                "stage": stage,
+                **stats,
+                "total_ms": round(sum(values), 2),
+            }
+        )
+    stage_breakdown.sort(key=lambda row: row["total_ms"], reverse=True)
+
+    top_slow_requests = []
+    for record in sorted(
+        [r for r in records if r.optimization_ms > 0],
+        key=lambda r: r.optimization_ms,
+        reverse=True,
+    )[:limit]:
+        slowest_stage, slowest_stage_ms = _slowest_stage(record)
+        top_slow_requests.append(
+            {
+                "timestamp": record.timestamp,
+                "request_id": record.request_id,
+                "model": record.model,
+                "client": record.client,
+                "optimization_ms": record.optimization_ms,
+                "total_ms": record.total_ms,
+                "tokens_before": record.tokens_before,
+                "tokens_after": record.tokens_after,
+                "tokens_saved": record.tokens_saved,
+                "slowest_stage": slowest_stage,
+                "slowest_stage_ms": slowest_stage_ms,
+                "transforms": record.transforms,
+            }
+        )
+
+    return {
+        "slow_threshold_ms": slow_threshold_ms,
+        "optimization_ms": {
+            **_latency_stats(opt_times),
+            "slow_request_count": len(slow_records),
+            "slow_request_pct": round(len(slow_records) / len(records) * 100, 1)
+            if records
+            else 0.0,
+        },
+        "total_ms": _latency_stats(total_times),
+        "stage_breakdown": stage_breakdown,
+        "top_slow_requests": top_slow_requests,
+    }
+
+
+def calculate_throughput(report: PerfReport) -> dict:
+    records = report.perf_records
+    parsed_records = []
+    for r in records:
+        ts = _parse_log_ts(r.timestamp)
+        if ts:
+            parsed_records.append((r, ts))
+
+    if not parsed_records:
+        empty = {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+        return {"rolling": empty.copy(), "current": empty.copy()}
+
+    # Calculate window from PERF timestamps to prevent dilution from other log lines
+    perf_timestamps = [pair[1] for pair in parsed_records]
+    oldest = min(perf_timestamps)
+    newest = max(perf_timestamps)
+    window_seconds = max(1.0, (newest - oldest).total_seconds())
+
+    rolling = _calculate_throughput_stats(records, window_seconds)
+
+    # 5-minute window calculations
+    current_records = []
+    current_window_seconds = 0.0
+    cutoff_5m = newest - timedelta(minutes=5)
+    current_pairs = [pair for pair in parsed_records if pair[1] >= cutoff_5m]
+    if current_pairs:
+        current_records = [pair[0] for pair in current_pairs]
+        cur_oldest = min(pair[1] for pair in current_pairs)
+        current_window_seconds = max(1.0, (newest - cur_oldest).total_seconds())
+
+    current = _calculate_throughput_stats(current_records, current_window_seconds)
+
+    return {"rolling": rolling, "current": current}
+
+
+def _calculate_throughput_stats(records: list[PerfRecord], window_seconds: float) -> dict:
+    if not records:
+        return {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+
+    # 1. Input Wall-Clock
+    total_tokens_before = sum(r.tokens_before for r in records)
+    input_wall = total_tokens_before / window_seconds if window_seconds > 0 else 0.0
+
+    # 2. Input Active
+    input_active_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            input_active_rates.append(r.tokens_before / (r.total_ms / 1000.0))
+
+    # 3. Compression
+    compression_rates = []
+    for r in records:
+        duration_ms = r.stages.get("compression_first_stage") or r.stages.get("compression")
+        if duration_ms is not None and duration_ms > 0:
+            compression_rates.append(r.tokens_before / (duration_ms / 1000.0))
+
+    # 4. Effective Forward
+    forward_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            forward_rates.append(r.tokens_after / (r.total_ms / 1000.0))
+
+    # 5. Output / Generation (Approximate generation throughput)
+    generation_rates = []
+    for r in records:
+        if r.tokens_out > 0:
+            duration_ms = r.total_ms
+            if r.ttfb_ms > 0 and r.total_ms > r.ttfb_ms:
+                duration_ms = r.total_ms - r.ttfb_ms
+            if duration_ms > 0:
+                generation_rates.append(r.tokens_out / (duration_ms / 1000.0))
+
+    return {
+        "input_wall_clock": round(input_wall, 2),
+        "input_active_p50": round(_percentile(input_active_rates, 0.5), 2),
+        "input_active_p95": round(_percentile(input_active_rates, 0.95), 2),
+        "compression_p50": round(_percentile(compression_rates, 0.5), 2),
+        "compression_p95": round(_percentile(compression_rates, 0.95), 2),
+        "forward_p50": round(_percentile(forward_rates, 0.5), 2),
+        "forward_p95": round(_percentile(forward_rates, 0.95), 2),
+        "generation_p50": round(_percentile(generation_rates, 0.5), 2),
+        "generation_p95": round(_percentile(generation_rates, 0.95), 2),
+    }
 
 
 def build_perf_summary(report: PerfReport) -> dict:
@@ -651,6 +1114,8 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_before = sum(r.tokens_before for r in records)
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
+    total_tool_saved = sum(r.tool_saved for r in records)
+    total_headline_saved = total_saved + total_tool_saved
 
     total_cr = sum(r.cache_read for r in records)
     total_cw = sum(r.cache_write for r in records)
@@ -664,7 +1129,9 @@ def build_perf_summary(report: PerfReport) -> dict:
     for model, recs in sorted(by_model_groups.items()):
         m_before = sum(r.tokens_before for r in recs)
         m_after = sum(r.tokens_after for r in recs)
-        m_saved = sum(r.tokens_saved for r in recs)
+        m_message_saved = sum(r.tokens_saved for r in recs)
+        m_tool_saved = sum(r.tool_saved for r in recs)
+        m_saved = m_message_saved + m_tool_saved
         by_model.append(
             {
                 "model": model,
@@ -672,7 +1139,9 @@ def build_perf_summary(report: PerfReport) -> dict:
                 "tokens_before": m_before,
                 "tokens_after": m_after,
                 "tokens_saved": m_saved,
-                "savings_pct": _pct(m_saved, m_before),
+                "message_tokens_saved": m_message_saved,
+                "tool_tokens_saved": m_tool_saved,
+                "savings_pct": _pct(m_saved, m_before + m_tool_saved),
                 "list_price_per_mtok": _get_list_price(model),
             }
         )
@@ -696,6 +1165,37 @@ def build_perf_summary(report: PerfReport) -> dict:
             }
         )
 
+    by_source_groups: dict[tuple[str, bool], dict[str, int | float | str | bool]] = {}
+    for record in records:
+        for item in record.savings_breakdown:
+            source = str(item.get("source") or "other")
+            realized = bool(item.get("realized", True))
+            key = (source, realized)
+            row = by_source_groups.setdefault(
+                key,
+                {
+                    "source": source,
+                    "realized": realized,
+                    "events": 0,
+                    "tokens": 0,
+                    "usd": 0.0,
+                },
+            )
+            row["events"] = int(row["events"]) + 1
+            raw_tokens = item.get("tokens", 0)
+            raw_usd = item.get("usd", 0.0)
+            tokens = int(raw_tokens) if isinstance(raw_tokens, (str, int, float)) else 0
+            usd = float(raw_usd) if isinstance(raw_usd, (str, int, float)) else 0.0
+            row["tokens"] = int(row["tokens"]) + max(0, tokens)
+            row["usd"] = round(
+                float(row["usd"]) + usd,
+                12,
+            )
+    by_source = sorted(
+        by_source_groups.values(),
+        key=lambda row: (-int(row["tokens"]), str(row["source"])),
+    )
+
     return {
         "window_hours": report.requested_hours,
         "actual_window": {
@@ -706,13 +1206,22 @@ def build_perf_summary(report: PerfReport) -> dict:
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
+        # total_tokens_saved is the headline (messages + tool-schema deferral); the two
+        # components stay for consumers that break the number down. See
+        # headroom.proxy.tool_schema_savings_policy.
+        "total_tokens_saved": total_headline_saved,
+        "total_savings_pct": _pct(total_headline_saved, total_before + total_tool_saved),
         "tokens_saved": total_saved,
+        "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "by_source": by_source,
+        "overhead": build_overhead_summary(report),
+        "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
     }
@@ -837,11 +1346,18 @@ def _generate_recommendations(report: PerfReport) -> list[str]:
                     )
 
         # Optimization latency
-        slow = [r for r in report.perf_records if r.optimization_ms > 500]
-        if len(slow) > len(report.perf_records) * 0.2:
+        overhead = build_overhead_summary(report)
+        opt_stats = overhead["optimization_ms"]
+        slow_count = int(opt_stats["slow_request_count"])
+        if slow_count > len(report.perf_records) * 0.2:
+            stage_hint = ""
+            if overhead["stage_breakdown"]:
+                stage_hint = f"; top stage: {overhead['stage_breakdown'][0]['stage']}"
             recs.append(
-                f"{len(slow)} requests took >500ms for optimization — "
-                "consider reducing transform pipeline"
+                f"{slow_count} requests took >{overhead['slow_threshold_ms']:.0f}ms "
+                "for optimization"
+                f"{stage_hint} — consider reducing heavy transforms or lowering "
+                "HEADROOM_COMPRESSION_TIMEOUT_SECONDS"
             )
 
     if report.router_records:

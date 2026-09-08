@@ -30,6 +30,7 @@ from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
     get_session_ccr_tracker,
+    history_references_ccr_tool,
     serialize_tool_definition_canonical,
 )
 
@@ -228,6 +229,68 @@ def test_no_session_id_falls_back_to_per_turn_decision():
     assert _has_ccr_tool(tools)
 
 
+def test_history_references_ccr_tool_detects_both_provider_shapes():
+    # Anthropic: assistant tool_use content block.
+    anthropic_hist = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": CCR_TOOL_NAME, "id": "t1", "input": {}}],
+        },
+    ]
+    assert history_references_ccr_tool(anthropic_hist) is True
+
+    # OpenAI: assistant tool_calls[].function.name.
+    openai_hist = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "function": {"name": CCR_TOOL_NAME, "arguments": "{}"}}],
+        }
+    ]
+    assert history_references_ccr_tool(openai_hist) is True
+
+    # No reference, and malformed shapes must not crash.
+    assert history_references_ccr_tool([{"role": "user", "content": "hi"}]) is False
+    assert (
+        history_references_ccr_tool([{"content": None}, {"tool_calls": None}, "x", None]) is False
+    )
+    assert history_references_ccr_tool("not-a-list") is False
+
+
+def test_sessionless_history_reference_forces_reinjection():
+    """#2440: no session_id + no fresh compression, but history already
+    references headroom_retrieve → the tool definition MUST be re-injected,
+    otherwise the provider rejects the request (400 tool not found)."""
+    history = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": CCR_TOOL_NAME, "id": "t1", "input": {}}],
+        }
+    ]
+
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=None,
+        request_id="r3",
+        existing_tools=None,
+        has_compressed_content_this_turn=False,
+        history_has_ccr_reference=history_references_ccr_tool(history),
+    )
+    assert injected is True
+    assert _has_ccr_tool(tools)
+
+    # No history reference and no fresh compression → still skip.
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=None,
+        request_id="r4",
+        existing_tools=None,
+        has_compressed_content_this_turn=False,
+        history_has_ccr_reference=False,
+    )
+    assert injected is False
+
+
 # ─── Byte-stable tool definition ───────────────────────────────────────
 
 
@@ -245,13 +308,8 @@ _ANTHROPIC_CCR_TOOL_SNAPSHOT_BYTES = (
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"},"
-    b'"query":{"type":"string",'
-    b'"description":"Optional search query to filter results. '
-    b"If provided, only returns items matching the query. "
-    b'If omitted, returns all original items."}'
-    b"},"
-    b'"required":["hash"]}}'
+    b"(e.g., 'abc123' from hash=abc123)\"}"
+    b'},"required":["hash"]}}'
 )
 
 _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
@@ -265,13 +323,8 @@ _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"},"
-    b'"query":{"type":"string",'
-    b'"description":"Optional search query to filter results. '
-    b"If provided, only returns items matching the query. "
-    b'If omitted, returns all original items."}'
-    b"},"
-    b'"required":["hash"]}}}'
+    b"(e.g., 'abc123' from hash=abc123)\"}"
+    b'},"required":["hash"]}}}'
 )
 
 

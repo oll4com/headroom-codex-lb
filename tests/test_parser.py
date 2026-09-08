@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from headroom.parser import (
+    _coerce_tool_call_to_dict,
     compute_hash,
     detect_waste_signals,
     find_tool_units,
@@ -23,6 +24,31 @@ from headroom.parser import (
     parse_message_to_blocks,
     parse_messages,
 )
+
+# --- Streaming SDK tool-call objects (issue #1312) ---
+
+
+class _FakeDeltaToolCallFunction:
+    """Mimics openai.types...ChoiceDeltaToolCallFunction: attribute access,
+    no `.get()`."""
+
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeChoiceDeltaToolCall:
+    """Mimics the OpenAI SDK streaming tool-call object that the Agno
+    wrapper surfaces. It is a Pydantic-style model — attribute access only,
+    crucially with NO `.get()` — which is exactly what triggered issue
+    #1312 (`'ChoiceDeltaToolCall' object has no attribute 'get'`)."""
+
+    def __init__(self, id: str, name: str, arguments: str, index: int = 0) -> None:
+        self.id = id
+        self.index = index
+        self.type = "function"
+        self.function = _FakeDeltaToolCallFunction(name, arguments)
+
 
 # --- Fixtures ---
 
@@ -361,6 +387,70 @@ class TestParseMessageToBlocks:
         """Token count is estimated."""
         blocks = parse_message_to_blocks(user_message, 0, mock_tokenizer)
         assert blocks[0].tokens_est > 0
+
+
+class TestStreamingToolCallObjects:
+    """Regression coverage for issue #1312: streaming integrations (Agno
+    over OpenAILike) can hand the parser raw OpenAI SDK `ChoiceDeltaToolCall`
+    objects instead of OpenAI-format dicts. The parser called `.get()` on
+    them and crashed the whole agent run with
+    `'ChoiceDeltaToolCall' object has no attribute 'get'`. Both the parser
+    call sites must now tolerate attribute-style tool-call objects."""
+
+    def test_coerce_dict_is_passthrough_identity(self):
+        d = {"id": "call_1", "function": {"name": "f", "arguments": "{}"}}
+        # A dict must be returned untouched (same object) — no needless copy.
+        assert _coerce_tool_call_to_dict(d) is d
+
+    def test_coerce_sdk_object_flattens_to_openai_dict(self):
+        tc = _FakeChoiceDeltaToolCall("call_1", "search", '{"q": "x"}')
+        out = _coerce_tool_call_to_dict(tc)
+        assert out == {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"q": "x"}'},
+        }
+
+    def test_coerce_object_with_dict_function(self):
+        # Some providers nest a dict `function` on an attribute-style object.
+        class _TC:
+            id = "call_2"
+            type = "function"
+            function = {"name": "g", "arguments": "1"}
+
+        out = _coerce_tool_call_to_dict(_TC())
+        assert out["function"] == {"name": "g", "arguments": "1"}
+
+    def test_coerce_none_degrades_to_empty_dict(self):
+        assert _coerce_tool_call_to_dict(None) == {}
+
+    def test_parse_message_to_blocks_with_sdk_tool_call(self, mock_tokenizer):
+        """The original crash site: parsing an assistant message whose
+        tool_calls are SDK objects must produce a tool_call block, not
+        raise AttributeError."""
+        tc = _FakeChoiceDeltaToolCall("call_abc", "dummy_tool", '{"query": "test"}')
+        msg = {"role": "assistant", "content": "", "tool_calls": [tc]}
+
+        blocks = parse_message_to_blocks(msg, 0, mock_tokenizer)
+
+        tool_call_blocks = [b for b in blocks if b.kind == "tool_call"]
+        assert len(tool_call_blocks) == 1
+        assert tool_call_blocks[0].flags.get("tool_call_id") == "call_abc"
+        assert tool_call_blocks[0].flags.get("function_name") == "dummy_tool"
+        assert "dummy_tool" in tool_call_blocks[0].text
+
+    def test_find_tool_units_with_sdk_tool_call(self):
+        """The second `.get()` site: find_tool_units must still pair an
+        SDK-object tool_call with its tool response message."""
+        tc = _FakeChoiceDeltaToolCall("call_abc", "dummy_tool", "{}")
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [tc]},
+            {"role": "tool", "content": "result", "tool_call_id": "call_abc"},
+        ]
+
+        units = find_tool_units(messages)
+
+        assert units == [(0, [1])]
 
 
 # --- TestParseMessages ---
@@ -1051,3 +1141,229 @@ class TestStrandsToolResultBlocks:
 
         assert anthropic_waste.total() > 0
         assert anthropic_waste.total() == openai_waste.total()
+
+
+# --- TestCallArgMatchReread ---
+
+
+class TestCallArgMatchReread:
+    """Tests for re-issued-call (arg-match) reread detection in parse_messages."""
+
+    LARGE_CONTENT = "def handler(event):\n    return process(event)\n" * 10  # > 200 chars
+    CHANGED_CONTENT = LARGE_CONTENT + "# mtime 1718000000\n"
+
+    def _expected_tokens(self, text):
+        """Mirror mock_tokenizer + message overhead used for tool_result blocks."""
+        return len(text) // 4 + 1 + 4
+
+    @staticmethod
+    def _filler(n):
+        """Interleaved turns that push a repeat beyond the polling gap."""
+        return [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"step {i} of the task"}
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _openai_call(call_id, name, arguments):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": call_id, "function": {"name": name, "arguments": arguments}}],
+        }
+
+    @staticmethod
+    def _openai_result(call_id, content):
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    def test_canonical_call_key_normalizes_serialization(self):
+        """Reordered JSON-string args, dict args, and spaced JSON hash equal."""
+        from headroom.parser import _canonical_call_key
+
+        k1 = _canonical_call_key("read_file", '{"path": "a.py", "lines": 100}')
+        k2 = _canonical_call_key("read_file", '{"lines":100,"path":"a.py"}')
+        k3 = _canonical_call_key("read_file", {"path": "a.py", "lines": 100})
+        assert k1 == k2 == k3
+        assert _canonical_call_key("read_file", '{"path": "b.py", "lines": 100}') != k1
+        assert _canonical_call_key("grep", '{"path": "a.py", "lines": 100}') != k1
+
+    def test_reissued_call_changed_result_counts(self, mock_tokenizer):
+        """Identical call re-issued far apart counts even when result bytes differ."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py", "lines": 100}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"lines":100,"path":"a.py"}'),
+                self._openai_result("c2", self.CHANGED_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_identical_result_not_double_counted(self, mock_tokenizer):
+        """Byte-identical repeat is counted once (content-hash pass wins)."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c2", self.LARGE_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_adjacent_reissue_is_polling(self, mock_tokenizer):
+        """Back-to-back identical calls (poll loop) are not re-reads."""
+        messages = [
+            self._openai_call("c1", "check_ci", '{"run": 7}'),
+            self._openai_result("c1", self.LARGE_CONTENT),
+            self._openai_call("c2", "check_ci", '{"run": 7}'),
+            self._openai_result("c2", self.CHANGED_CONTENT),
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_different_args_not_matched(self, mock_tokenizer):
+        """Same tool with different arguments is not a re-issued call."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"path": "b.py"}'),
+                self._openai_result("c2", self.CHANGED_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_small_result_ignored(self, mock_tokenizer):
+        """Repeat of a call whose result is trivially small is skipped."""
+        messages = (
+            [
+                self._openai_call("c1", "run_tests", "{}"),
+                self._openai_result("c1", "ok"),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "run_tests", "{}"),
+                self._openai_result("c2", "ok again"),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_repeat_call_without_result_not_counted(self, mock_tokenizer):
+        """A re-issued call with no recorded result contributes nothing."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [self._openai_call("c2", "read_file", '{"path": "a.py"}')]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_anthropic_tool_use_produces_tool_call_blocks(self, mock_tokenizer):
+        """Anthropic tool_use parts become tool_call blocks with call metadata."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now."},
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "read_file",
+                        "input": {"path": "a.py"},
+                    },
+                ],
+            }
+        ]
+        blocks, _, _ = parse_messages(messages, mock_tokenizer)
+        tool_calls = [b for b in blocks if b.kind == "tool_call"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].flags["function_name"] == "read_file"
+        assert tool_calls[0].flags["tool_call_id"] == "t1"
+        assert tool_calls[0].flags["call_key"]
+
+    def test_anthropic_reissued_call_changed_result_counts(self, mock_tokenizer):
+        """Full Anthropic-format flow: re-issued tool_use with drifted result."""
+
+        def call(uid):
+            return {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": uid, "name": "read_file", "input": {"path": "a.py"}}
+                ],
+            }
+
+        def result(uid, content):
+            return {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": uid, "content": content}],
+            }
+
+        messages = (
+            [call("t1"), result("t1", self.LARGE_CONTENT)]
+            + self._filler(4)
+            + [call("t2"), result("t2", self.CHANGED_CONTENT)]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_strands_tooluse_matched(self, mock_tokenizer):
+        """Strands/Bedrock toolUse/toolResult format is matched the same way."""
+
+        def call(uid):
+            return {
+                "role": "assistant",
+                "content": [{"toolUse": {"toolUseId": uid, "name": "search", "input": {"q": "x"}}}],
+            }
+
+        def result(uid, content):
+            return {
+                "role": "user",
+                "content": [{"toolResult": {"toolUseId": uid, "content": [{"text": content}]}}],
+            }
+
+        messages = (
+            [call("s1"), result("s1", self.LARGE_CONTENT)]
+            + self._filler(4)
+            + [call("s2"), result("s2", self.CHANGED_CONTENT)]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_cross_format_call_key_parity(self, mock_tokenizer):
+        """OpenAI JSON-string args and Anthropic dict input produce the same call_key."""
+        openai_msgs = [self._openai_call("c1", "read_file", '{"lines": 100, "path": "a.py"}')]
+        anthropic_msgs = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "read_file",
+                        "input": {"path": "a.py", "lines": 100},
+                    }
+                ],
+            }
+        ]
+        o_blocks, _, _ = parse_messages(openai_msgs, mock_tokenizer)
+        a_blocks, _, _ = parse_messages(anthropic_msgs, mock_tokenizer)
+        o_key = [b for b in o_blocks if b.kind == "tool_call"][0].flags["call_key"]
+        a_key = [b for b in a_blocks if b.kind == "tool_call"][0].flags["call_key"]
+        assert o_key == a_key

@@ -26,6 +26,24 @@ from headroom import HeadroomConfig, HeadroomMode
 pytestmark = pytest.mark.skipif(not AGNO_AVAILABLE, reason="Agno not installed")
 
 
+def _response_usage(input_tokens: int, output_tokens: int, total_tokens: int):
+    """Build response usage across Agno 2.x and 3.x module layouts."""
+
+    try:
+        from agno.metrics import MessageMetrics
+
+        metrics_type = MessageMetrics
+    except ImportError:
+        from agno.models.metrics import Metrics
+
+        metrics_type = Metrics
+    return metrics_type(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 @pytest.fixture
 def mock_agno_model():
     """Create a mock Agno model (OpenAIChat-like)."""
@@ -50,17 +68,11 @@ def mock_agno_model():
 
     # Mock invoke method (returns ModelResponse for Agno's response() loop)
     def mock_invoke(messages, **kwargs):
-        from agno.models.metrics import Metrics
-
         # Create a proper ModelResponse that Agno's response() can process
         return ModelResponse(
             role="assistant",
             content="Hello! I'm a mock response.",
-            response_usage=Metrics(
-                input_tokens=10,
-                output_tokens=5,
-                total_tokens=15,
-            ),
+            response_usage=_response_usage(10, 5, 15),
         )
 
     mock.invoke = MagicMock(side_effect=mock_invoke)
@@ -73,16 +85,10 @@ def mock_agno_model():
 
     # Mock invoke_stream for streaming
     def mock_invoke_stream(messages, **kwargs):
-        from agno.models.metrics import Metrics
-
         yield ModelResponse(
             role="assistant",
             content="Streaming...",
-            response_usage=Metrics(
-                input_tokens=10,
-                output_tokens=5,
-                total_tokens=15,
-            ),
+            response_usage=_response_usage(10, 5, 15),
         )
 
     mock.invoke_stream = MagicMock(side_effect=mock_invoke_stream)
@@ -269,6 +275,46 @@ class TestHeadroomAgnoModel:
         assert openai_msgs[0]["role"] == "assistant"
         assert "tool_calls" in openai_msgs[0]
         assert openai_msgs[1]["tool_call_id"] == "call_123"
+
+    def test_convert_messages_normalizes_streaming_tool_call_objects(self, mock_agno_model):
+        """Regression for issue #1312: in streaming mode Agno can surface
+        tool_calls as raw OpenAI SDK objects (`ChoiceDeltaToolCall`) with
+        attribute access and no `.get()`. `_convert_messages_to_openai`
+        must flatten them to OpenAI-format dicts so neither the Headroom
+        pipeline nor Agno's re-serialization hits
+        `'ChoiceDeltaToolCall' object has no attribute 'get'`."""
+        from headroom.integrations.agno import HeadroomAgnoModel
+
+        # Mimic the OpenAI SDK streaming object: attribute access, no .get().
+        class _Fn:
+            def __init__(self, name, arguments):
+                self.name = name
+                self.arguments = arguments
+
+        class _ChoiceDeltaToolCall:
+            def __init__(self, id, name, arguments):
+                self.id = id
+                self.index = 0
+                self.type = "function"
+                self.function = _Fn(name, arguments)
+
+        assistant_msg = MagicMock()
+        assistant_msg.role = "assistant"
+        assistant_msg.content = ""
+        assistant_msg.tool_calls = [
+            _ChoiceDeltaToolCall("call_999", "dummy_tool", '{"query": "test"}')
+        ]
+        assistant_msg.tool_call_id = None
+
+        model = HeadroomAgnoModel(wrapped_model=mock_agno_model)
+        openai_msgs = model._convert_messages_to_openai([assistant_msg])
+
+        tool_calls = openai_msgs[0]["tool_calls"]
+        # Every entry must now be a plain dict, not the SDK object.
+        assert all(isinstance(tc, dict) for tc in tool_calls)
+        assert tool_calls[0]["id"] == "call_999"
+        assert tool_calls[0]["function"]["name"] == "dummy_tool"
+        assert tool_calls[0]["function"]["arguments"] == '{"query": "test"}'
 
     def test_response_applies_optimization(self, mock_agno_model, sample_messages):
         """response() applies Headroom optimization."""

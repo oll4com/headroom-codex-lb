@@ -4,7 +4,7 @@
   "uiHints": {
     "proxyUrl": {
       "label": "Proxy URL",
-      "help": "Optional. URL of a Headroom proxy (example: http://127.0.0.1:8787 or https://headroom.example.com). If omitted, plugin auto-detects on localhost. Auto-start only works for local addresses."
+      "help": "Optional. URL Headroom proxy (example: http://127.0.0.1:8787 or https://headroom.example.com). Configured URLs probe-gated before provider routing. Auto-start opt-in only works local addresses."
     },
     "proxyPort": {
       "label": "Proxy Port",
@@ -21,6 +21,18 @@
     "connectTimeoutSeconds": {
       "label": "Connect Timeout Seconds",
       "help": "Optional upstream connection timeout for the auto-started local Headroom proxy. Lower values surface network failures sooner."
+    },
+    "requestTimeoutMs": {
+      "label": "Compression Request Timeout",
+      "help": "Maximum milliseconds to wait for one compression request before returning the original messages."
+    },
+    "circuitBreakerThreshold": {
+      "label": "Circuit Breaker Threshold",
+      "help": "Consecutive compression failures before temporarily bypassing Headroom."
+    },
+    "circuitBreakerCooldownMs": {
+      "label": "Circuit Breaker Cooldown",
+      "help": "Milliseconds to bypass compression after the circuit breaker opens."
     },
     "routeCodexViaProxy": {
       "label": "Route OpenAI Codex Via Headroom",
@@ -53,7 +65,7 @@
       },
       "autoStart": {
         "type": "boolean",
-        "default": true
+        "default": false
       },
       "startupTimeoutMs": {
         "type": "integer",
@@ -68,6 +80,21 @@
       "connectTimeoutSeconds": {
         "type": "integer",
         "minimum": 1
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 30000
+      },
+      "circuitBreakerThreshold": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 3
+      },
+      "circuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 60000
       },
       "routeCodexViaProxy": {
         "type": "boolean",
@@ -89,5 +116,10 @@
         "https://*:*"
       ]
     }
+  },
+  "contracts": {
+    "tools": [
+      "headroom_retrieve"
+    ]
   }
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,13 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
 
 import click
 
@@ -30,8 +38,12 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import load_manifest, save_manifest
+from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
 
@@ -51,6 +63,16 @@ _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
+_TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
+_TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
+_TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
+_CODEX_FEATURES_TABLE_RE = re.compile(
+    rf"^[ \t]*\[[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\][ \t]*(?:#.*)?$"
+)
+_CODEX_FEATURES_DOTTED_LEGACY_RE = re.compile(
+    rf"^[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\.[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*="
+)
+_CODEX_FEATURES_LEGACY_KEY_RE = re.compile(rf"^[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*=")
 
 
 def _command_string(parts: list[str]) -> str:
@@ -129,7 +151,18 @@ def _json_file(path: Path) -> dict[str, Any]:
     content = path.read_text(encoding="utf-8").strip()
     if not content:
         return {}
-    payload = json.loads(content)
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as e:
+        # This is a user-owned file (e.g. ~/.claude/settings.json or Codex's
+        # hooks.json) that the callers read-merge-write. Returning {} would make
+        # the following _write_json overwrite it, silently discarding the user's
+        # settings; letting the raw JSONDecodeError propagate crashes `headroom
+        # init` with a traceback. Abort with an actionable message so the user
+        # can fix the JSON (or move it aside) without losing it.
+        raise click.ClickException(
+            f"{path} contains invalid JSON ({e}); fix it and re-run, or move it aside."
+        ) from e
     return payload if isinstance(payload, dict) else {}
 
 
@@ -144,6 +177,17 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     payload = _json_file(path)
     env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     env_map["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    # GH #746: with a custom ANTHROPIC_BASE_URL and ENABLE_TOOL_SEARCH unset,
+    # Claude Code stops deferring MCP/system tool schemas and materializes them
+    # all into its context window — overflowing it (breaks sub-agent spawns,
+    # forces constant compaction). Keep deferral on; respect a user-set value.
+    # Shares the TOOL_SEARCH_* constants with `wrap` and `install`.
+    tool_search_default = (
+        TOOL_SEARCH_FOUNDRY_DEFAULT
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY")
+        else TOOL_SEARCH_DEFAULT
+    )
+    env_map.setdefault(TOOL_SEARCH_ENV, tool_search_default)
     payload["env"] = env_map
 
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
@@ -210,10 +254,7 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
 def _replace_marker_block(
     content: str, marker_start: str, marker_end: str, block: str, *, at_root: bool = False
 ) -> str:
-    if marker_start in content and marker_end in content:
-        start = content.index(marker_start)
-        end = content.index(marker_end) + len(marker_end)
-        content = content[:start].rstrip() + "\n\n" + content[end:].lstrip()
+    content = _remove_marker_block(content, marker_start, marker_end)
     block = block.strip()
     if at_root:
         # The block carries top-level keys, so it must sit above the first table
@@ -221,13 +262,20 @@ def _replace_marker_block(
         # into that table and Codex rejects the config (#260).
         lines = content.splitlines()
         for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
+            if _TOML_TABLE_HEADER_RE.search(line):
                 head = "\n".join(lines[:index]).rstrip()
                 tail = "\n".join(lines[index:]).lstrip("\n")
                 prefix = f"{head}\n\n" if head else ""
                 return (f"{prefix}{block}\n\n{tail}").rstrip() + "\n"
     return (content.rstrip() + "\n\n" + block + "\n").lstrip()
+
+
+def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> str:
+    if marker_start not in content or marker_end not in content:
+        return content
+    start = content.index(marker_start)
+    end = content.index(marker_end) + len(marker_end)
+    return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
 def _strip_codex_init_block(content: str) -> str:
@@ -271,6 +319,14 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     import re
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n"
+        if codex_uses_chatgpt_auth(path.parent / "auth.json")
+        else ""
+    )
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -279,14 +335,22 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
-    # init owns model_provider/openai_base_url: drop any prior assignment (any
-    # value, including one an older version mis-scoped under a table) so we
-    # replace it instead of emitting a duplicate top-level key (#260).
-    content = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", content)
-    content = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", content)
+    # init owns the ROOT-level model_provider/openai_base_url: drop any prior
+    # root assignment so we replace it instead of emitting a duplicate top-level
+    # key (#260). Scope the strip to the document root (everything before the
+    # first table header) -- these keys also appear legitimately inside
+    # [profiles.*] tables as per-profile overrides, and stripping them there
+    # silently reroutes the user's profiles to the injected "headroom" default.
+    _first_table = re.search(r"(?m)^[ \t]*\[", content)
+    _split = _first_table.start() if _first_table else len(content)
+    root, rest = content[:_split], content[_split:]
+    root = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", root)
+    root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
+    content = root + rest
     # The provider block carries top-level keys (model_provider, openai_base_url),
     # so it must land at the document root rather than after a trailing table (#260).
     content = _replace_marker_block(
@@ -294,61 +358,134 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    # Codex filters its history menu by the active model_provider, so existing
+    # native threads vanish once we switch to "headroom". Retag them to match the
+    # active provider so the history stays whole (#961), mirroring the install
+    # (providers.codex.install) and wrap (cli.wrap) paths. The revert direction is
+    # handled by `headroom unwrap codex`.
+    retag_to_headroom(path.parent)
+
+
+def _codex_feature_block() -> str:
+    return f"{_CODEX_FEATURE_MARKER_START}\nhooks = true\n{_CODEX_FEATURE_MARKER_END}"
+
+
+def _codex_dotted_feature_block() -> str:
+    return f"{_CODEX_FEATURE_MARKER_START}\nfeatures.hooks = true\n{_CODEX_FEATURE_MARKER_END}"
+
+
+def _codex_features_table_index(lines: list[str]) -> int | None:
+    return next(
+        (index for index, line in enumerate(lines) if _CODEX_FEATURES_TABLE_RE.search(line)),
+        None,
+    )
+
+
+def _codex_features(content: str) -> dict[str, Any] | None:
+    if not content.strip():
+        return None
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return None
+    features = parsed.get("features")
+    return features if isinstance(features, dict) else None
+
+
+def _codex_features_has_hooks(content: str) -> bool:
+    features = _codex_features(content)
+    if features is None:
+        # Keep init resilient for already-invalid user configs; this fallback
+        # only needs to avoid adding a second obvious hooks line.
+        lines = content.splitlines()
+        features_index = _codex_features_table_index(lines)
+        if features_index is None:
+            return False
+        for line in lines[features_index + 1 :]:
+            if _TOML_TABLE_HEADER_RE.search(line):
+                break
+            if re.search(r"^[ \t]*hooks[ \t]*=", line):
+                return True
+        return False
+
+    return "hooks" in features
+
+
+def _strip_codex_legacy_feature_flag(content: str) -> str:
+    lines = content.splitlines(keepends=True)
+    retained: list[str] = []
+    in_features = False
+    in_root = True
+
+    for line in lines:
+        if _TOML_TABLE_HEADER_RE.search(line):
+            in_root = False
+            in_features = bool(_CODEX_FEATURES_TABLE_RE.search(line))
+            retained.append(line)
+            continue
+        if (in_root and _CODEX_FEATURES_DOTTED_LEGACY_RE.search(line)) or (
+            in_features and _CODEX_FEATURES_LEGACY_KEY_RE.search(line)
+        ):
+            continue
+        retained.append(line)
+
+    return "".join(retained)
 
 
 def _ensure_codex_feature_flag(path: Path) -> None:
+    """Ensure Codex's ``[features].hooks`` flag is enabled in config.toml.
+
+    ``hooks`` is the canonical key. ``codex_hooks`` was the original key name and
+    still resolves as a deprecated alias, but Codex >= 0.129 emits a deprecation
+    warning for it (renamed in openai/codex#20522). Any legacy
+    ``[features].codex_hooks`` line is removed, whether inside or outside our
+    marker block, so a migrated config drops the deprecated key and never
+    collides with a duplicate ``hooks`` key. A user-managed ``hooks`` value
+    outside our marker block is left untouched.
+    """
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Drop the deprecated alias key from [features]. Mirrors the top-level key
+    # cleanup in _ensure_codex_provider (#260) so re-running init migrates a
+    # legacy config rather than producing a duplicate `hooks` key, while leaving
+    # unrelated user tables untouched.
+    content = _strip_codex_legacy_feature_flag(content)
     if _CODEX_FEATURE_MARKER_START in content and _CODEX_FEATURE_MARKER_END in content:
-        block = f"{_CODEX_FEATURE_MARKER_START}\ncodex_hooks = true\n{_CODEX_FEATURE_MARKER_END}"
-        content = _replace_marker_block(
-            content,
-            _CODEX_FEATURE_MARKER_START,
-            _CODEX_FEATURE_MARKER_END,
-            block,
+        # init owns its marker block; remove it first, then reinsert under the
+        # correct TOML scope below.
+        content = _remove_marker_block(
+            content, _CODEX_FEATURE_MARKER_START, _CODEX_FEATURE_MARKER_END
         )
-    elif "[features]" in content:
-        lines = content.splitlines()
-        inserted = False
-        for index, line in enumerate(lines):
-            if line.strip() != "[features]":
-                continue
-            section_end = index + 1
-            while section_end < len(lines) and not (
-                lines[section_end].startswith("[") and lines[section_end].endswith("]")
-            ):
-                if "codex_hooks" in lines[section_end]:
-                    inserted = True
-                    break
-                section_end += 1
-            if not inserted:
-                lines[index + 1 : index + 1] = [
-                    _CODEX_FEATURE_MARKER_START,
-                    "codex_hooks = true",
-                    _CODEX_FEATURE_MARKER_END,
-                ]
-                inserted = True
-            break
-        content = "\n".join(lines).rstrip() + "\n"
-        if not inserted:
-            content = (
-                content.rstrip()
-                + "\n\n[features]\n"
-                + _CODEX_FEATURE_MARKER_START
-                + "\n"
-                + "codex_hooks = true\n"
-                + _CODEX_FEATURE_MARKER_END
-                + "\n"
-            )
+
+    if _codex_features_has_hooks(content):
+        # A user-managed `[features].hooks` key already exists outside our
+        # marker block; respect their value. Clearing the legacy key above was
+        # the only work.
+        pass
     else:
-        content = (
-            content.rstrip()
-            + "\n\n[features]\n"
-            + _CODEX_FEATURE_MARKER_START
-            + "\n"
-            + "codex_hooks = true\n"
-            + _CODEX_FEATURE_MARKER_END
-            + "\n"
-        ).lstrip()
+        lines = content.splitlines()
+        features_index = _codex_features_table_index(lines)
+        if features_index is not None:
+            # Leading blank line matches the normalisation _replace_marker_block
+            # applies on later runs, so re-running init is byte-idempotent.
+            lines[features_index + 1 : features_index + 1] = [
+                "",
+                *_codex_feature_block().splitlines(),
+            ]
+            content = "\n".join(lines).rstrip() + "\n"
+        elif _codex_features(content) is not None:
+            # The user expressed [features] via dotted keys, so adding a new
+            # table would duplicate it. Keep this key at the document root.
+            content = _replace_marker_block(
+                content,
+                _CODEX_FEATURE_MARKER_START,
+                _CODEX_FEATURE_MARKER_END,
+                _codex_dotted_feature_block(),
+                at_root=True,
+            )
+        else:
+            content = (
+                content.rstrip() + "\n\n[features]\n\n" + _codex_feature_block() + "\n"
+            ).lstrip()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
@@ -356,24 +493,43 @@ def _ensure_codex_feature_flag(path: Path) -> None:
 def _ensure_codex_hooks(path: Path, profile: str) -> None:
     logger.debug("ensure codex hooks: %s (profile=%s)", path, profile)
     command = f"{_hook_command('--profile', profile)} --marker {_CODEX_HOOK_MARKER}"
-    payload = {
-        "hooks": {
-            "SessionStart": [
-                {
-                    "matcher": "startup|resume",
-                    "hooks": [{"type": "command", "command": command, "timeout": 15}],
-                }
-            ],
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": command, "timeout": 15}],
-                }
-            ],
-        }
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # Read-merge-write rather than overwrite: the previous version wrote a fresh
+    # payload wholesale, destroying any user-managed hooks (and other top-level
+    # keys) in codex hooks.json. Merge per event and dedup on the Headroom
+    # marker, matching _ensure_claude_hooks / _ensure_copilot_hooks.
+    payload = _json_file(path)
+    hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
+    for event, matcher in (
+        ("SessionStart", "startup|resume"),
+        ("PreToolUse", "Bash"),
+    ):
+        entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
+        retained: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                retained.append(entry)
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                retained.append(entry)
+                continue
+            has_headroom = any(
+                isinstance(item, dict)
+                and item.get("command")
+                and _CODEX_HOOK_MARKER in str(item.get("command"))
+                for item in hook_items
+            )
+            if not has_headroom:
+                retained.append(entry)
+        retained.append(
+            {
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command, "timeout": 15}],
+            }
+        )
+        hooks[event] = retained
+    payload["hooks"] = hooks
+    _write_json(path, payload)
 
 
 def _manifest_changed(
@@ -407,7 +563,12 @@ def _ensure_runtime_manifest(
     memory: bool,
 ) -> str:
     profile = _runtime_profile(global_scope)
-    existing = load_manifest(profile)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as e:
+        # Recover from a corrupt manifest by overwriting it rather than crashing.
+        click.echo(f"Warning: {e}; overwriting.")
+        existing = None
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
         profile=profile,
@@ -423,7 +584,7 @@ def _ensure_runtime_manifest(
         proxy_mode="token",
         memory_enabled=memory,
         telemetry_enabled=True,
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
     manifest.supervisor_kind = SupervisorKind.NONE.value
     manifest.artifacts = []
@@ -459,7 +620,7 @@ def _env_manifest(values: dict[str, str]) -> Any:
         proxy_mode="token",
         memory_enabled=False,
         telemetry_enabled=True,
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
 
 
@@ -500,12 +661,10 @@ def _marketplace_source() -> str:
 
 def _run_checked(command: list[str], *, action: str) -> None:
     logger.debug("subprocess [%s]: %s", action, _command_string(command))
-    result = subprocess.run(
+    result = run(
         command,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     logger.debug(
         "subprocess [%s] exit=%s stdout=%r stderr=%r",
@@ -577,7 +736,11 @@ def _suppress_hook_output() -> Iterator[None]:
 
 
 def _ensure_profile_running(profile: str) -> None:
-    manifest = load_manifest(profile)
+    # Best-effort hook path: a corrupt manifest must not crash the session.
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError:
+        return
     if manifest is None:
         return
     with _suppress_hook_output():
@@ -790,7 +953,13 @@ def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
 
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")
-@click.option("--port", default=8787, type=int, show_default=True, help="Headroom proxy port.")
+@click.option(
+    "--port",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help="Headroom proxy port.",
+)
 @click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
@@ -827,6 +996,11 @@ def init(
         memory,
         ctx.invoked_subcommand,
     )
+    if anyllm_provider and backend != "anyllm":
+        click.echo(
+            f"Warning: --anyllm-provider is ignored unless --backend anyllm "
+            f"(got --backend {backend})."
+        )
     if ctx.invoked_subcommand is not None:
         ctx.obj = {
             "global_scope": global_scope,
@@ -930,14 +1104,22 @@ def init_hook() -> None:
 def init_hook_ensure(profile: str | None, marker: str | None) -> None:
     """Best-effort ensure used by installed agent hooks."""
     del marker
+
+    def _has_manifest(name: str) -> bool:
+        # Best-effort: a corrupt manifest must not crash the session-start hook.
+        try:
+            return load_manifest(name) is not None
+        except ManifestError:
+            return False
+
     profiles: list[str] = []
     if profile:
         profiles.append(profile)
     else:
         local_profile = _local_profile()
-        if load_manifest(local_profile) is not None:
+        if _has_manifest(local_profile):
             profiles.append(local_profile)
-        elif load_manifest(_GLOBAL_PROFILE) is not None:
+        elif _has_manifest(_GLOBAL_PROFILE):
             profiles.append(_GLOBAL_PROFILE)
     for name in profiles:
         _ensure_profile_running(name)

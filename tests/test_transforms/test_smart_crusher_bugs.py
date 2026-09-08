@@ -124,6 +124,65 @@ class TestRecursionDepthLimit:
         assert isinstance(parsed, list)
 
 
+class TestLosslessOnlyMode:
+    """`lossless_only` produces marker-free, byte-recoverable output.
+
+    Strict mode: lossless tabular compaction still applies, but any path
+    that would need a CCR marker (lossy row-drop OR opaque-blob offload)
+    leaves the content uncompacted instead — so the result is always
+    marker-free and decodes back to the original input without loss.
+    """
+
+    def _droppable_rows(self) -> list[dict]:
+        return [{"path": "a.py", "line": i, "content": "x" * 300} for i in range(50)]
+
+    def test_lossless_only_is_marker_free_and_byte_recoverable(self) -> None:
+        rows = self._droppable_rows()
+        config = SmartCrusherConfig(
+            min_items_to_analyze=3,
+            min_tokens_to_crush=0,
+            lossless_min_savings_ratio=0.99,  # force the would-be-lossy path
+            lossless_only=True,
+        )
+        out = SmartCrusher(config=config).crush(json.dumps(rows))
+        assert "<<ccr:" not in out.compressed
+        assert json.loads(out.compressed) == rows
+
+    def test_crush_kwarg_overrides_configured_mode(self) -> None:
+        # Configured non-strict, but the per-call kwarg forces strict mode
+        # for this call: marker-free and fully recoverable.
+        rows = self._droppable_rows()
+        config = SmartCrusherConfig(
+            min_items_to_analyze=3,
+            min_tokens_to_crush=0,
+            lossless_min_savings_ratio=0.99,
+        )
+        crusher = SmartCrusher(config=config)
+        out = crusher.crush(json.dumps(rows), lossless_only=True)
+        assert "<<ccr:" not in out.compressed
+        assert json.loads(out.compressed) == rows
+
+
+def test_extract_context_survives_null_function_tool_call() -> None:
+    # A tool_call with an explicit {"function": null} must not crash context
+    # extraction: `dict.get("function", {})` returns None for a present-but-null
+    # key, and `.get` on None raises AttributeError inside apply().
+    crusher = _make_crusher()
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": None},
+                {"id": "2", "type": "function", "function": {"arguments": "keep-me"}},
+            ],
+        },
+    ]
+
+    ctx = crusher._extract_context_from_messages(messages)
+
+    assert "keep-me" in ctx
+
+
 # Stage 3c.1 lockstep bug-fix tests previously lived here; they probed
 # Python helpers (`_percentile_linear`, `_detect_sequential_pattern`,
 # `_detect_rare_status_values`, `_compute_k_split`) that were removed

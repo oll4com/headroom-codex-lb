@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ class FakePlugin:
         self._projects = projects
         self.writer = FakeWriter()
         self.scan_calls: list[tuple[object, int]] = []
+        self.last_include_subagents: bool | None = None
 
     def detect(self) -> bool:
         return True
@@ -52,8 +54,9 @@ class FakePlugin:
     def discover_projects(self) -> list[object]:
         return self._projects
 
-    def scan_project(self, project, max_workers: int = 1):  # noqa: ANN001, ANN201
+    def scan_project(self, project, max_workers: int = 1, include_subagents: bool = True):  # noqa: ANN001, ANN201
         self.scan_calls.append((project, max_workers))
+        self.last_include_subagents = include_subagents
         return [SimpleNamespace(events=["event"], tool_calls=[], failure_count=0)]
 
 
@@ -173,6 +176,74 @@ def test_learn_project_lookup_and_apply_flow(
     assert plugin.writer.calls[0][2] is False
 
 
+def test_verbosity_all_apply_aggregates_baselines_across_projects(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    import json as _json
+
+    from headroom.proxy.output_savings import BaselineModel, SavingsLedger
+
+    # Two projects, each with a transcript dir holding a dummy session file
+    # (analyze is faked, so contents are irrelevant — only presence matters).
+    proj_a_dir = tmp_path / "a"
+    proj_b_dir = tmp_path / "b"
+    for d in (proj_a_dir, proj_b_dir):
+        d.mkdir()
+        (d / "s.jsonl").write_text("{}")
+    proj_a = SimpleNamespace(name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir)
+    proj_b = SimpleNamespace(name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir)
+    plugin = FakePlugin("claude", "Claude Code", [proj_a, proj_b])
+
+    # Per-project synthetic baselines. Project A has more samples, so its level
+    # must be the one applied.
+    base_a = BaselineModel()
+    for v in (100, 200, 300):
+        base_a.observe("opus|new_user_ask|s|tools", v)
+    base_b = BaselineModel()
+    base_b.observe("sonnet|unknown|m|notools", 50)
+
+    class _Profile:
+        def __init__(self, level: int) -> None:
+            self.level = level
+            self.confidence = "high"
+            self.source = "heuristic"
+            self.rationale = "test"
+            self.signals: dict[str, object] = {}
+            self.learned_at: str | None = None
+
+        def save(self, path: object) -> None:
+            Path(str(path)).write_text(_json.dumps({"level": self.level}))
+
+    results = {
+        str(proj_a.project_path): (_Profile(1), base_a),
+        str(proj_b.project_path): (_Profile(3), base_b),
+    }
+
+    def fake_analyze(session_paths, project_path, llm_judge=None):  # noqa: ANN001, ANN201
+        return results[project_path]
+
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.verbosity.analyze", fake_analyze)
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "claude", "--verbosity", "--all", "--apply"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    ledger = SavingsLedger.load(tmp_path / "ws" / "output_savings.json")
+    # Aggregated, not last-project-wins: both strata present and totals summed.
+    assert ledger.baseline.total_samples == 4
+    assert "opus|new_user_ask|s|tools" in ledger.baseline.strata
+    assert "sonnet|unknown|m|notools" in ledger.baseline.strata
+    assert "across 2 project(s)" in result.output
+    # The applied level comes from the project with the most samples (A → 1).
+    verbosity = _json.loads((tmp_path / "ws" / "verbosity.json").read_text())
+    assert verbosity["level"] == 1
+
+
 def test_learn_reports_missing_requested_project_and_lists_discovered(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
 ) -> None:
@@ -259,7 +330,7 @@ def test_learn_handles_empty_sessions_and_no_pattern_outputs(
     no_actions = SimpleNamespace(name="no-actions", project_path=tmp_path / "no-actions")
 
     class BranchingPlugin(FakePlugin):
-        def scan_project(self, project, max_workers: int = 1):  # noqa: ANN001, ANN201
+        def scan_project(self, project, max_workers: int = 1, include_subagents: bool = True):  # noqa: ANN001, ANN201
             self.scan_calls.append((project, max_workers))
             if project is no_sessions:
                 return []
@@ -297,3 +368,193 @@ def test_learn_handles_empty_sessions_and_no_pattern_outputs(
     assert "No conversation data found." in result.output
     assert "No failures or patterns found." in result.output
     assert "No actionable patterns found." in result.output
+
+
+def test_learn_surfaces_analysis_failure_and_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project = SimpleNamespace(name="broken", project_path=tmp_path / "broken")
+    plugin = FakePlugin("codex", "Codex", [project])
+
+    class FailingAnalyzer(FakeAnalyzer):
+        def analyze(self, project, sessions):  # noqa: ANN001, ANN201
+            self.calls.append((project, sessions))
+            return SimpleNamespace(
+                total_sessions=1,
+                total_calls=3,
+                total_failures=1,
+                failure_rate=1 / 3,
+                recommendations=[],
+                analysis_error="codex CLI failed (exit 1): Not inside a trusted directory",
+            )
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "codex-cli")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FailingAnalyzer)
+
+    result = runner.invoke(main, ["learn", "--agent", "codex", "--all"])
+
+    assert result.exit_code == 1
+    assert "Analysis failed: codex CLI failed (exit 1)" in result.output
+    assert "No actionable patterns found." not in result.output
+
+
+def test_learn_main_only_flag_threads_to_scanner(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    proj = SimpleNamespace(name="proj", project_path=project_path)
+    plugin = FakePlugin("codex", "Codex", [proj])
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FakeAnalyzer)
+
+    # Default: descend into subagent/workflow transcripts.
+    result = runner.invoke(main, ["learn", "--agent", "codex", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert plugin.last_include_subagents is True
+
+    # --main-only restricts to top-level main sessions.
+    plugin.last_include_subagents = None
+    result = runner.invoke(
+        main, ["learn", "--agent", "codex", "--all", "--main-only"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    assert plugin.last_include_subagents is False
+
+
+class TargetAwareWriter(FakeWriter):
+    """A writer that supports --target and surfaces a migration warning."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_target: str | None = None
+
+    def set_context_target(self, target: str | None) -> None:
+        self.context_target = target
+
+    def write(self, recommendations, project, dry_run: bool):  # noqa: ANN001, ANN201
+        self.calls.append((recommendations, project, dry_run))
+        return SimpleNamespace(
+            dry_run=dry_run,
+            content_by_file={
+                Path(project.project_path) / "CLAUDE.local.md": "<!-- headroom -->\nRule 1"
+            },
+            warnings=["Moved Headroom learnings out of CLAUDE.md into CLAUDE.local.md."],
+        )
+
+
+def test_learn_target_threads_to_writer_and_prints_warnings(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    proj = SimpleNamespace(name="proj", project_path=project_path)
+    plugin = FakePlugin("claude", "Claude Code", [proj])
+    plugin.writer = TargetAwareWriter()
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FakeAnalyzer)
+
+    result = runner.invoke(
+        main,
+        [
+            "learn",
+            "--agent",
+            "claude",
+            "--project",
+            str(project_path),
+            "--apply",
+            "--target",
+            "CLAUDE.md",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    # --target is threaded into the writer...
+    assert plugin.writer.context_target == "CLAUDE.md"
+    # ...and the writer's warnings are surfaced to the user.
+    assert "Moved Headroom learnings" in result.output
+
+
+def test_learn_target_ignored_for_unsupported_agent(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    proj = SimpleNamespace(name="proj", project_path=project_path)
+    # FakePlugin's FakeWriter has no set_context_target, so --target is unsupported.
+    plugin = FakePlugin("codex", "Codex", [proj])
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FakeAnalyzer)
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "codex", "--project", str(project_path), "--target", "CLAUDE.md"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Note: --target is not supported for codex" in result.output
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, "live"), (False, "blocked")])
+def test_activate_output_shaper_reports_effective_rollout_decision(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, expected: str
+) -> None:
+    import urllib.request
+
+    from headroom.cli.learn import _activate_output_shaper
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "rollout": {
+                        "features": [
+                            {"name": "proxy_output_shaper", "enabled": enabled},
+                        ]
+                    }
+                }
+            ).encode()
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
+
+    status, port = _activate_output_shaper(9876)
+
+    assert status == expected
+    assert port == 9876
+
+
+def test_activate_output_shaper_handles_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    from headroom.cli.learn import _activate_output_shaper
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return b"not-json"
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
+
+    assert _activate_output_shaper(9876) == ("error", 9876)

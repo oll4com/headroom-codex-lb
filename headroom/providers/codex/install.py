@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 import re
+import subprocess
 from pathlib import Path
+from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from headroom._subprocess import run
 from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMutation, ToolTarget
 from headroom.install.paths import codex_config_path
 
 from .runtime import proxy_base_url
+from .threads import retag_to_headroom, retag_to_native
 
 _CODEX_MARKER_START = "# --- Headroom persistent provider ---"
 _CODEX_MARKER_END = "# --- end Headroom persistent provider ---"
@@ -29,6 +41,106 @@ _ORPHAN_HEADROOM_TABLE = re.compile(
     r"(?=^\[|\Z)"
 )
 
+_TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
+_ROOT_MODEL_PROVIDER_RE = re.compile(r"^[ \t]*model_provider[ \t]*=")
+_ROOT_OPENAI_BASE_URL_RE = re.compile(r"^[ \t]*openai_base_url[ \t]*=")
+
+
+def _codex_credential_store(config_dir: Path) -> str | None:
+    try:
+        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    store = config.get("cli_auth_credentials_store")
+    return store.lower() if isinstance(store, str) else None
+
+
+def _codex_login_status(config_dir: Path) -> bool:
+    env = {**os.environ, "CODEX_HOME": str(config_dir)}
+    try:
+        result = run(
+            ["codex", "login", "status"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return False
+    message = result.stdout.strip() or result.stderr.strip()
+    return result.returncode == 0 and message.casefold() == "logged in using chatgpt"
+
+
+def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
+    """Whether Codex authenticated via ChatGPT OAuth (vs an OpenAI API key).
+
+    The account menu (profile/email/plan/usage) only renders when the active
+    provider carries ``requires_openai_auth = true``, but that flag forces codex
+    to demand an OpenAI OAuth login (#406) and would break API-key users.  So we
+    emit it only in ChatGPT-OAuth mode, read from the sibling ``auth.json``.
+    """
+    try:
+        raw = auth_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if _codex_credential_store(auth_path.parent) not in {"keyring", "auto"}:
+            return False
+        return _codex_login_status(auth_path.parent)
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    mode = data.get("auth_mode")
+    if isinstance(mode, str):
+        return mode.lower() == "chatgpt"
+    # Older auth.json files predate `auth_mode`: infer from an OAuth account id.
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        account_id = tokens.get("account_id")
+        if isinstance(account_id, str) and account_id.strip():
+            return True
+        return _id_token_carries_chatgpt_account(tokens.get("id_token"))
+    return False
+
+
+def _id_token_carries_chatgpt_account(raw: Any) -> bool:
+    """Whether an ``id_token`` carries the ChatGPT account claim (#3206).
+
+    Newer Codex releases can write an ``auth.json`` with neither ``auth_mode``
+    nor a top-level ``tokens.account_id``; the account identity lives only in
+    the ``id_token`` claims. Those configs then read as API-key mode, so
+    ``requires_openai_auth`` is omitted, Codex attaches no Authorization
+    header, and every request 401s with "Missing bearer".
+
+    The payload is decoded, not verified. This is a local config file the user
+    already owns, and the result only decides which key we write into their own
+    ``config.toml`` -- nothing is authenticated or authorised on the strength
+    of it. An API-key user has no ChatGPT id_token, so this cannot resurrect
+    the forced-OAuth-login regression in #406.
+    """
+    if not isinstance(raw, str):
+        return False
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return False
+    if not isinstance(claims, dict):
+        return False
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claim, dict):
+        return False
+    account_id = auth_claim.get("chatgpt_account_id")
+    return isinstance(account_id, str) and bool(account_id.strip())
+
 
 def build_provider_section(
     *,
@@ -37,12 +149,14 @@ def build_provider_section(
     marker_start: str = _CODEX_MARKER_START,
     marker_end: str = _CODEX_MARKER_END,
     include_markers: bool = True,
+    requires_openai_auth: bool = False,
 ) -> str:
-    """Build a managed Codex provider block (without requires_openai_auth).
+    """Build a managed Codex provider block.
 
-    Bug 3 (#406): requires_openai_auth must NOT appear on custom provider
-    blocks — it forces codex to demand OpenAI OAuth login for local-proxy
-    traffic.  The built-in openai provider carries this flag; headroom does not.
+    ``requires_openai_auth`` is emitted only for ChatGPT-OAuth users: the flag
+    is what makes codex render the account menu, but it also forces codex to
+    demand an OpenAI OAuth login (#406), which breaks API-key users.  Callers
+    pass the result of :func:`codex_uses_chatgpt_auth`; it defaults to ``False``.
     """
     body = (
         "[model_providers.headroom]\n"
@@ -50,6 +164,8 @@ def build_provider_section(
         f'base_url = "{proxy_base_url(port)}"\n'
         "supports_websockets = true\n"
     )
+    if requires_openai_auth:
+        body += "requires_openai_auth = true\n"
     if not include_markers:
         return body
     return f"{marker_start}\n{body}{marker_end}\n"
@@ -59,6 +175,41 @@ def build_install_env(*, port: int, backend: str) -> dict[str, str]:
     """Build the persistent install environment for Codex."""
     del backend
     return {"OPENAI_BASE_URL": proxy_base_url(port)}
+
+
+def _insert_block_at_root(content: str, block: str) -> str:
+    """Place a marker block carrying top-level keys above the first TOML table.
+
+    Codex scopes bare keys under the preceding ``[table]`` header, so a
+    ``model_provider`` appended after a table (e.g. ``[features]``) is silently
+    ignored and routing never switches (#260). Land the block at the document
+    root instead.
+    """
+    block = block.strip()
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if _TOML_TABLE_HEADER_RE.search(line):
+            head = "\n".join(lines[:index]).rstrip()
+            tail = "\n".join(lines[index:]).lstrip("\n")
+            prefix = f"{head}\n\n" if head else ""
+            return (f"{prefix}{block}\n\n{tail}").rstrip() + "\n"
+    return (content.rstrip() + "\n\n" + block + "\n").lstrip()
+
+
+def _strip_root_provider_assignments(content: str) -> str:
+    """Remove root provider assignments without touching table-scoped settings."""
+    lines = content.splitlines(keepends=True)
+    kept: list[str] = []
+    in_root = True
+    for line in lines:
+        if in_root and _TOML_TABLE_HEADER_RE.search(line):
+            in_root = False
+        if in_root and (
+            _ROOT_MODEL_PROVIDER_RE.match(line) or _ROOT_OPENAI_BASE_URL_RE.match(line)
+        ):
+            continue
+        kept.append(line)
+    return "".join(kept)
 
 
 def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None:
@@ -76,18 +227,20 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
             port=manifest.port,
             name="Headroom persistent proxy",
             include_markers=False,
+            requires_openai_auth=codex_uses_chatgpt_auth(path.parent / "auth.json"),
         )
         + f"{_CODEX_MARKER_END}\n"
     )
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if _CODEX_MARKER_START in existing:
-            merged = _CODEX_PATTERN.sub(section, existing)
-        else:
-            merged = existing.rstrip() + "\n\n" + section + "\n"
-    else:
-        merged = section + "\n"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Drop our previous block and any prior top-level provider assignment so the
+    # managed keys override the user's, then land them at the document root.
+    existing = _CODEX_PATTERN.sub("", existing)
+    existing = _strip_root_provider_assignments(existing)
+    merged = _insert_block_at_root(existing, section)
     path.write_text(merged, encoding="utf-8")
+    # Pull existing native threads into the headroom-provider menu so Codex's
+    # history list stays whole once it routes through Headroom. Best-effort.
+    retag_to_headroom(path.parent)
     return ManagedMutation(target=ToolTarget.CODEX.value, kind="toml-block", path=str(path))
 
 
@@ -109,3 +262,6 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     content = _ORPHAN_OPENAI_BASE_URL.sub("", content)
     content = _ORPHAN_HEADROOM_TABLE.sub("", content)
     path.write_text(content.strip() + "\n", encoding="utf-8")
+    # Hand the threads back to the native-provider menu so the full history stays
+    # visible once Codex no longer routes through Headroom. Best-effort.
+    retag_to_native(path.parent)

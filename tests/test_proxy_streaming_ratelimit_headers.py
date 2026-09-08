@@ -87,7 +87,8 @@ class TestStreamingRatelimitHeaderForwarding:
             "anthropic-ratelimit-output-tokens-limit": "30000",
             "anthropic-ratelimit-output-tokens-remaining": "27000",
             "anthropic-ratelimit-output-tokens-reset": "2026-03-25T12:00:00Z",
-            # Non-ratelimit headers that should NOT be forwarded
+            # request-id is forwarded (clients record it per transcript turn);
+            # cf-ray is a non-allowlisted header that must NOT be forwarded.
             "x-request-id": "req-12345",
             "cf-ray": "abc123",
         }
@@ -151,7 +152,7 @@ class TestStreamingRatelimitHeaderForwarding:
 
     @pytest.mark.asyncio
     async def test_non_ratelimit_headers_not_forwarded(self):
-        """Only ratelimit headers should be forwarded, not arbitrary upstream headers."""
+        """Arbitrary upstream headers stay dropped; the request-id family is allowed."""
         proxy = self._create_mock_proxy()
         mock_response = self._create_mock_upstream_response()
 
@@ -179,8 +180,54 @@ class TestStreamingRatelimitHeaderForwarding:
             optimization_latency=0.0,
         )
 
-        # Non-ratelimit headers should NOT be in the response
-        assert result.headers.get("x-request-id") is None
+        # request-id is forwarded; other non-ratelimit headers are not.
+        assert result.headers.get("x-request-id") == "req-12345"
+        assert result.headers.get("cf-ray") is None
+
+    @pytest.mark.asyncio
+    async def test_request_id_headers_forwarded_in_streaming(self):
+        """The request-id family is forwarded on the streaming path (#1100)."""
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        mock_response.headers = httpx.Headers(
+            {
+                "content-type": "text/event-stream",
+                "request-id": "req-aaa",
+                "anthropic-request-id": "req-bbb",
+                "x-request-id": "req-ccc",
+                # Non-allowlisted header: must NOT be forwarded.
+                "cf-ray": "ray-123",
+            }
+        )
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-1100",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.media_type == "text/event-stream"
+        assert result.headers.get("request-id") == "req-aaa"
+        assert result.headers.get("anthropic-request-id") == "req-bbb"
+        assert result.headers.get("x-request-id") == "req-ccc"
         assert result.headers.get("cf-ray") is None
 
     @pytest.mark.asyncio
@@ -417,6 +464,105 @@ class TestStreamingRatelimitHeaderForwarding:
         assert chunks
 
     @pytest.mark.asyncio
+    async def test_upstream_stream_closed_when_body_never_consumed(self):
+        """A never-iterated streaming body must still release the upstream stream (#2797).
+
+        The upstream stream is opened before the body generator, and the
+        generator's own ``aclosing`` only runs if the body is iterated. When a
+        client disconnects before Starlette starts sending the body the
+        generator never runs, so the close must come from the response's
+        ``background`` task instead — otherwise every such request leaks an open
+        HTTP/2 stream and the pooled upstream connection eventually exhausts its
+        100 concurrent streams ("Max outbound streams is 100, 100 open").
+        """
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-abandoned-stream",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        # Simulate the client disconnecting before the body is consumed: the
+        # generator is never iterated, so its aclosing never runs.
+        mock_response.aclose.assert_not_awaited()
+
+        # Starlette runs the response's background task in exactly this case.
+        assert result.background is not None, "streaming response must carry a cleanup task"
+        await result.background()
+
+        mock_response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upstream_stream_released_over_asgi_lifecycle_on_disconnect(self):
+        """Driving the real ASGI response through an early disconnect releases the stream.
+
+        Rather than calling ``result.background()`` directly, this exercises the
+        Starlette response lifecycle with a client that disconnects immediately,
+        and asserts the upstream stream is closed by the end of it -- proving the
+        cleanup this PR attaches is actually invoked by Starlette, not merely
+        present on the response object.
+        """
+        import asyncio
+
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-asgi-lifecycle",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        async def receive():
+            # The client is already gone before the body is streamed.
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        scope = {"type": "http", "method": "POST", "headers": []}
+        await asyncio.wait_for(result(scope, receive, send), timeout=5.0)
+
+        # By the end of the response lifecycle the upstream stream is released.
+        mock_response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_codex_rate_limit_headers_captured_and_forwarded_in_streaming(self):
         """Codex x-codex-* headers must refresh /stats state AND reach the client.
 
@@ -475,9 +621,10 @@ class TestStreamingRatelimitHeaderForwarding:
         #    keeps working through the proxy on the streaming path.
         assert result.headers.get("x-codex-primary-used-percent") == "42.0"
         assert result.headers.get("x-codex-limit-name") == "gpt-5.4-codex"
-        # 3. Generic ratelimit headers still forwarded; unrelated headers dropped.
+        # 3. Generic ratelimit headers and the request-id family forwarded;
+        #    other unrelated headers dropped.
         assert result.headers.get("anthropic-ratelimit-tokens-limit") == "80000"
-        assert result.headers.get("x-request-id") is None
+        assert result.headers.get("x-request-id") == "req-12345"
 
     @pytest.mark.asyncio
     async def test_codex_rate_limit_captured_on_streaming_429(self):

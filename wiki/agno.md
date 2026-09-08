@@ -167,6 +167,7 @@ Full async support for high-throughput applications:
 import asyncio
 from headroom.integrations.agno import HeadroomAgnoModel
 
+
 async def process_async():
     model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
 
@@ -178,6 +179,7 @@ async def process_async():
         print(chunk, end="", flush=True)
 
     print(f"\nTokens saved: {model.total_tokens_saved}")
+
 
 asyncio.run(process_async())
 ```
@@ -347,7 +349,7 @@ The integration operates at the model layer, not the agent layer. Some Agno feat
 ### Best Practices for Maximum Savings
 
 1. **Tool-heavy agents see the biggest wins** — Tool results (JSON, logs, search results) compress 70-90%
-2. **Long conversations benefit from RollingWindow** — Configure context limits to avoid hitting provider maximums
+2. **Long conversations are handled automatically** — Headroom compresses the newest tool outputs and content blocks in place (live-zone-only compression) and never drops messages from history, so the cache hot zone stays intact. No context-limit configuration is required.
 3. **Wrap at the model level, not agent level** — This ensures all LLM calls go through optimization
 4. **Use hooks for observability** — Track token usage patterns to identify optimization opportunities
 

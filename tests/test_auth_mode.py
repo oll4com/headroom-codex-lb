@@ -16,6 +16,7 @@ from headroom.proxy.auth_mode import (
     SUBSCRIPTION_UA_PREFIXES,
     AuthMode,
     classify_auth_mode,
+    classify_client,
 )
 
 
@@ -43,6 +44,15 @@ def test_oauth_jwt_classified_oauth() -> None:
 def test_oauth_sk_ant_oat_classified_oauth() -> None:
     """Claude Pro / Max OAuth: ``Bearer sk-ant-oat-...``."""
     headers = {"authorization": "Bearer sk-ant-oat-01-abc123def456"}
+    assert classify_auth_mode(headers) is AuthMode.OAUTH
+
+
+def test_oauth_real_sk_ant_oat01_classified_oauth() -> None:
+    """Real Anthropic OAuth access tokens are ``sk-ant-oat01-...`` (a version
+    number, no dash after ``oat``). These must classify as OAUTH — matching on
+    ``sk-ant-oat-`` missed them and let them fall through to PAYG, enabling
+    aggressive lossy compression on subscription-bound requests."""
+    headers = {"authorization": "Bearer sk-ant-oat01-abc123def456"}
     assert classify_auth_mode(headers) is AuthMode.OAUTH
 
 
@@ -186,3 +196,9 @@ def test_classify_under_100us_per_call() -> None:
     per_call_us = (elapsed / iters) * 1_000_000
 
     assert per_call_us < 100, f"classify_auth_mode took {per_call_us:.2f} us/call (limit: 100 us)"
+
+
+def test_classify_client_uses_default_when_no_client_signal():
+    headers = {"user-agent": "anthropic/0.42.0"}
+
+    assert classify_client(headers, default="claude") == "claude"

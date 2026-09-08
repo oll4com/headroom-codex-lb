@@ -19,6 +19,7 @@ import pytest
 from headroom.proxy.auth_mode import AuthMode
 from headroom.transforms.compression_policy import (
     CompressionPolicy,
+    cache_write_multiplier_for_ttl,
     policy_default_payg,
     policy_for_mode,
 )
@@ -169,25 +170,49 @@ class TestNetCostFormula:
     """
 
     def test_small_shave_deep_suffix_is_loss(self):
-        # 2000*(1.25 + 0.1*9) - 1.0*1.15*50000 = 4300 - 57500 = -53200.
+        # 2000*(1.25 + 0.1*9) - 1.0*1.15*52000 = 4300 - 59800 = -55500.
         p = policy_for_mode(AuthMode.PAYG)
         gain = p.net_mutation_gain(2_000, 50_000, 10.0, 1.0)
-        assert abs(gain - (-53_200.0)) < 1.0
+        assert abs(gain - (-55_500.0)) < 1.0
         assert not p.should_mutate_deep(2_000, 50_000, 10.0, 1.0)
 
     def test_big_shave_shallow_suffix_is_win(self):
-        # 50000*(1.25 + 0.1*2) - 1.0*1.15*10000 = 72500 - 11500 = 61000.
+        # 50000*(1.25 + 0.1*2) - 1.0*1.15*60000 = 72500 - 69000 = 3500.
+        # Tight but positive — consistent with the 2.3-read break-even.
         p = policy_for_mode(AuthMode.PAYG)
         gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0)
-        assert abs(gain - 61_000.0) < 1.0
+        assert abs(gain - 3_500.0) < 1.0
         assert p.should_mutate_deep(50_000, 10_000, 3.0, 1.0)
 
-    def test_live_zone_edit_always_profitable(self):
-        # S = 0 derives the existing Subscription live-zone policy as a
-        # special case of the formula.
+        one_hour_gain = p.net_mutation_gain(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            write_multiplier=2.0,
+        )
+        assert abs(one_hour_gain - (-4_000.0)) < 1.0
+        assert not p.should_mutate_deep(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            write_multiplier=2.0,
+        )
+
+    def test_cache_write_multiplier_follows_ttl_tier(self):
+        assert cache_write_multiplier_for_ttl(300) == 1.25
+        assert cache_write_multiplier_for_ttl(3600) == 2.0
+
+    def test_no_suffix_edit_profitable_with_reads_remaining(self):
+        # S = 0: warm-case saving is the avoided rereads, dT*r*R —
+        # positive whenever at least one read remains. At R=0 with a
+        # warm cache the gain is exactly 0 (already written, never read
+        # again): pointless rather than harmful.
         p = policy_for_mode(AuthMode.SUBSCRIPTION)
-        assert p.should_mutate_deep(1, 0, 0.0, 1.0)
-        assert p.should_mutate_deep(2_000, 0, 0.0, 1.0)
+        assert p.should_mutate_deep(1, 0, 1.0, 1.0)
+        assert p.should_mutate_deep(2_000, 0, 1.0, 1.0)
+        assert abs(p.net_mutation_gain(2_000, 0, 0.0, 1.0)) < 1e-6
 
     def test_cold_cache_ignores_suffix(self):
         # P_alive = 0 (TTL lapsed): the idle-timer compaction window.
@@ -220,11 +245,11 @@ class TestNetCostFormula:
         assert p.net_mutation_gain(2_000, -1, 5.0, 1.0) == p.net_mutation_gain(2_000, 0, 5.0, 1.0)
 
     def test_break_even_reads_matches_research_anchor(self):
-        # R = 11.5*(S/dT - 1): 2K/50K -> 276; 50K/10K -> negative
-        # (profitable from the first read); dT=0 -> 0.
+        # R = 11.5*S/dT, the #856 anchors exactly: 2K/50K -> 287.5;
+        # 50K/10K -> 2.3; dT=0 -> 0.
         p = policy_for_mode(AuthMode.PAYG)
-        assert abs(p.break_even_reads(2_000, 50_000) - 276.0) < 0.5
-        assert p.break_even_reads(50_000, 10_000) < 0.0
+        assert abs(p.break_even_reads(2_000, 50_000) - 287.5) < 0.5
+        assert abs(p.break_even_reads(50_000, 10_000) - 2.3) < 0.05
         assert p.break_even_reads(0, 10_000) == 0.0
 
     def test_constants_match_rust(self):

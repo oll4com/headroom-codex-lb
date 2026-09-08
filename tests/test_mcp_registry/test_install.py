@@ -51,10 +51,14 @@ class _FakeRegistrar(MCPRegistrar):
 # ----------------------------------------------------------------------
 
 
-def test_build_spec_default_proxy_no_env() -> None:
+def test_build_spec_default_proxy_no_env(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: ["/opt/headroom/bin/headroom"],
+    )
     spec = build_headroom_spec()
     assert spec.name == "headroom"
-    assert spec.command == "headroom"
+    assert spec.command == "/opt/headroom/bin/headroom"
     assert spec.args == ("mcp", "serve")
     assert spec.env == {}
 
@@ -69,20 +73,53 @@ def test_build_spec_default_url_omits_env() -> None:
     assert spec.env == {}
 
 
+def test_build_spec_falls_back_to_python_module_when_no_binary(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.runtime.shutil.which", lambda name: None)
+    monkeypatch.setattr("headroom.install.runtime.sys.executable", "/usr/bin/python")
+
+    spec = build_headroom_spec()
+
+    assert spec.command == "/usr/bin/python"
+    assert spec.args == ("-m", "headroom.cli", "mcp", "serve")
+    assert spec.env == {}
+
+
 def test_build_serena_spec_uses_agent_context() -> None:
     spec = build_serena_spec("codex")
     assert spec.name == "serena"
     assert spec.command == "uvx"
     assert spec.args == (
+        # PyPI package with prebuilt wheels, not the git source (#2871).
         "--from",
-        "git+https://github.com/oraios/serena",
+        "serena-agent",
         "serena",
         "start-mcp-server",
         "--project-from-cwd",
         "--context",
         "codex",
+        "--open-web-dashboard",
+        "False",
     )
     assert spec.env == {}
+
+
+def test_build_serena_spec_uses_pypi_not_git_source() -> None:
+    """Serena is installed from the PyPI package (prebuilt wheels), not the git
+    source, which forces a from-source build that fails under proot-based
+    filesystems where uv cannot hardlink into a build venv (#2871)."""
+    spec = build_serena_spec("codex")
+    assert "serena-agent" in spec.args
+    assert not any("git+" in arg for arg in spec.args)
+
+
+def test_build_serena_spec_disables_dashboard_popup_by_default() -> None:
+    # Headroom installs Serena by default; the dashboard browser tab must not
+    # auto-open. The flag overrides the user's serena_config.yml at startup,
+    # so this holds even when the user never created a Serena config.
+    for context in ("codex", "claude-code"):
+        spec = build_serena_spec(context)
+        idx = spec.args.index("--open-web-dashboard")
+        assert spec.args[idx + 1] == "False"
 
 
 # ----------------------------------------------------------------------

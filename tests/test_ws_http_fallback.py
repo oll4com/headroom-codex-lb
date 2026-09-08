@@ -266,6 +266,30 @@ class TestWsHttpFallback:
         assert "chatgpt.com" in captured_url["url"]
         assert "api.openai.com" not in captured_url["url"]
 
+    def test_fallback_chatgpt_auth_forces_store_false(self):
+        """ChatGPT Responses backend requires explicit store=false."""
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        captured_kwargs: dict = {}
+
+        class CapturingClient:
+            def stream(self, method, url, **kwargs):
+                captured_kwargs.update(kwargs)
+                return FakeStreamResponse(200, ["data: [DONE]\n\n"])
+
+        handler.http_client = CapturingClient()
+
+        body = {"model": "gpt-5.4", "input": "test", "store": True}
+        headers = {
+            "Authorization": "Bearer chatgpt-session-token",
+            "ChatGPT-Account-ID": "acct_abc123",
+        }
+        asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), headers, "req_store"))
+
+        posted = json.loads(captured_kwargs["content"])
+        assert posted["store"] is False
+        assert posted["stream"] is True
+
     def test_fallback_routes_api_key_to_openai(self):
         """API key auth should route to api.openai.com."""
         handler = _make_handler()
@@ -285,6 +309,53 @@ class TestWsHttpFallback:
         asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), headers, "req_6"))
 
         assert "api.openai.com" in captured_url["url"]
+
+    def test_fallback_returns_provider_usage_from_completed_event(self):
+        """The fallback must surface the provider's input usage (#2957).
+
+        Otherwise the WS session-end outcome records input_tokens=0 for a large
+        request and savings percentages blow past 100.
+        """
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 31055,
+                    "output_tokens": 246,
+                    "input_tokens_details": {"cached_tokens": 20000},
+                }
+            },
+        }
+        sse_lines = [
+            'data: {"type":"response.created","response":{"id":"r1"}}\n\n',
+            f"data: {json.dumps(completed)}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        handler.http_client = FakeHttpClient(FakeStreamResponse(200, sse_lines))
+
+        body = {"model": "gpt-5.4", "input": "big context"}
+        usage = asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_usage"))
+
+        input_tokens, output_tokens, cache_read, _cache_write, uncached = usage
+        assert input_tokens == 31055
+        assert output_tokens == 246
+        assert cache_read == 20000
+        assert uncached == 31055 - 20000
+
+    def test_fallback_returns_zero_usage_without_completed_event(self):
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        handler.http_client = FakeHttpClient(
+            FakeStreamResponse(200, ['data: {"type":"response.created"}\n\n', "data: [DONE]\n\n"])
+        )
+        usage = asyncio.run(
+            handler._ws_http_fallback(
+                ws, {"model": "gpt-5.4", "input": "hi"}, json.dumps({"input": "hi"}), {}, "req_none"
+            )
+        )
+        assert usage == (0, 0, 0, 0, 0)
 
     def test_fallback_refreshes_codex_rate_limit_state(self, monkeypatch):
         """A successful fallback refreshes Codex /stats from response headers.

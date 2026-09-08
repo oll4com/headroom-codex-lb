@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import argparse
 from unittest.mock import patch
 
 import pytest
@@ -88,6 +89,38 @@ class TestLearnNoLearnConflict:
         assert cfg.traffic_learning_enabled is False
 
 
+class TestHttpProxyOption:
+    """--http-proxy should configure only the provider HTTPX clients."""
+
+    def test_http_proxy_cli_flag(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--http-proxy", "http://proxy.local:8080"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_http_proxy_env_var(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_HTTP_PROXY": "http://proxy.local:8080"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_direct_server_env_http_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import headroom.proxy.server as server_mod
+
+        monkeypatch.delenv(server_mod._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setenv("HEADROOM_HTTP_PROXY", "http://proxy.local:8080")
+
+        config = server_mod._proxy_config_from_env()
+        assert config.http_proxy == "http://proxy.local:8080"
+
+
 class TestSubscriptionPollIntervalValidation:
     """--subscription-poll-interval should reject values outside 1-3600."""
 
@@ -157,6 +190,23 @@ class TestRetryMaxAttemptsValidation:
 
     def test_above_max_is_rejected(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["proxy", "--retry-max-attempts", "11"])
+        assert result.exit_code != 0
+
+
+class TestRetryDelayValidation:
+    def test_retry_delays_are_forwarded(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--retry-base-delay-ms", "250", "--retry-max-delay-ms", "5000"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 250
+        assert mock_run_server["config"].retry_max_delay_ms == 5000
+
+    @pytest.mark.parametrize("option", ["--retry-base-delay-ms", "--retry-max-delay-ms"])
+    def test_negative_delay_is_rejected(self, runner: CliRunner, option: str) -> None:
+        result = runner.invoke(main, ["proxy", option, "-1"])
         assert result.exit_code != 0
 
 
@@ -249,32 +299,58 @@ class TestMemoryTopKValidation:
 class TestMissingProxyDepsError:
     """When proxy dependencies are absent the CLI should print an actionable error and exit 1."""
 
-    def test_import_error_exits_nonzero(self, runner: CliRunner) -> None:
-        with patch.dict(
-            "sys.modules",
-            {"headroom.proxy.server": None},
+    @pytest.mark.proxy_dependency_gate
+    def test_proxy_command_exits_when_mcp_missing(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(
+            name: str,
+            globals: dict | None = None,
+            locals: dict | None = None,
+            fromlist: tuple = (),
+            level: int = 0,
         ):
-            result = runner.invoke(main, ["proxy"])
-        # Click CliRunner may raise SystemExit or catch it; exit code must be non-zero
-        assert result.exit_code != 0
+            if name == "mcp":
+                raise ImportError("No module named 'mcp'")
+            return real_import(name, globals, locals, fromlist, level)
 
-    def test_import_error_message_is_actionable(self, runner: CliRunner) -> None:
-        """The error message should tell the user how to fix the problem."""
-        original_import = (
-            __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-        )
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        result = runner.invoke(main, ["proxy"])
+        assert result.exit_code == 1, result.output
+        assert "pip install headroom-ai[proxy]" in result.output
+        assert "No module named 'mcp'" in result.output
 
-        def patched_import(name, *args, **kwargs):
-            if name == "headroom.proxy.server":
-                raise ImportError("No module named 'headroom.proxy.server'")
-            return original_import(name, *args, **kwargs)
+    @pytest.mark.proxy_dependency_gate
+    def test_ensure_proxy_dependencies_exits_when_fastapi_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
 
-        with patch("builtins.__import__", side_effect=patched_import):
-            result = runner.invoke(main, ["proxy"])
+        from headroom.cli.proxy import ensure_proxy_dependencies
 
-        # Either exit code 1 or output with actionable guidance
-        # (some test environments may shadow the import differently)
-        assert result.exit_code != 0 or "proxy" in result.output.lower()
+        real_import = builtins.__import__
+
+        def fake_import(
+            name: str,
+            globals: dict | None = None,
+            locals: dict | None = None,
+            fromlist: tuple = (),
+            level: int = 0,
+        ):
+            if name == "fastapi":
+                raise ImportError("No module named 'fastapi'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        with pytest.raises(SystemExit) as exc_info:
+            ensure_proxy_dependencies()
+
+        assert exc_info.value.code == 1
 
 
 class TestKeyboardInterruptExitCode:
@@ -317,6 +393,20 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].retry_max_attempts == 5
 
+    def test_headroom_retry_delays_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={
+                "HEADROOM_RETRY_BASE_DELAY_MS": "125",
+                "HEADROOM_RETRY_MAX_DELAY_MS": "8000",
+            },
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 125
+        assert mock_run_server["config"].retry_max_delay_ms == 8000
+
     def test_headroom_connect_timeout_from_env(
         self, runner: CliRunner, mock_run_server: dict
     ) -> None:
@@ -328,6 +418,48 @@ class TestNewEnvVarWiring:
         )
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].connect_timeout_seconds == 30
+
+    def test_headroom_anthropic_buffered_timeout_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS": "900"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 900
+
+    def test_anthropic_buffered_timeout_cli_flag(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--anthropic-buffered-request-timeout-seconds", "901"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 901
+
+    def test_direct_server_env_timeout_zero_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.server as server_mod
+
+        monkeypatch.delenv(server_mod._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setenv("HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS", "0")
+
+        config = server_mod._proxy_config_from_env()
+        assert config.anthropic_buffered_request_timeout_seconds == 600
+
+    def test_direct_server_timeout_parser_rejects_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.server as server_mod
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            server_mod._positive_int_arg("0")
 
     def test_headroom_backend_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
         result = runner.invoke(
@@ -372,6 +504,11 @@ class TestHelpTextCompleteness:
     def test_help_contains_mode_option(self, runner: CliRunner) -> None:
         assert "--mode" in self._help(runner)
 
+    def test_help_reports_cache_as_default_mode(self, runner: CliRunner) -> None:
+        out = self._help(runner)
+        assert "Optimization mode (default: cache)" in out
+        assert "Optimization mode (default: token)" not in out
+
     def test_help_contains_workers_option(self, runner: CliRunner) -> None:
         assert "--workers" in self._help(runner)
 
@@ -405,3 +542,34 @@ class TestHelpTextCompleteness:
         result = runner.invoke(main, ["proxy", "--mode", "bogus_mode_xyz"])
         assert result.exit_code != 0
         assert "invalid" in result.output.lower() or "choice" in result.output.lower()
+
+
+class TestCompressionMaxWorkers:
+    """--compression-max-workers / HEADROOM_COMPRESSION_MAX_WORKERS must reach ProxyConfig.
+
+    Regression: the field was documented in ProxyConfig and consumed by the
+    server, but the CLI never defined the option or passed it through, so it
+    was permanently None (always resolving to the automatic server default).
+    """
+
+    def test_flag_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main, ["proxy", "--compression-max-workers", "3"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 3
+
+    def test_env_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_COMPRESSION_MAX_WORKERS": "5"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 5
+
+    def test_default_is_none(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers is None

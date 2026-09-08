@@ -13,7 +13,7 @@ from urllib.request import urlopen
 
 logger = logging.getLogger(__name__)
 
-CBM_VERSION = "v0.6.0"
+CBM_VERSION = "v0.8.1"
 CBM_REPO = "DeusData/codebase-memory-mcp"
 CBM_BIN_DIR = Path.home() / ".local" / "bin"
 CBM_BIN_NAME = "codebase-memory-mcp"
@@ -77,13 +77,17 @@ def download_cbm(version: str | None = None) -> Path:
     except Exception as e:
         raise RuntimeError(f"Failed to download codebase-memory-mcp from {url}: {e}") from e
 
+    from headroom.binaries import verify_download_bytes
+
+    verify_download_bytes(data, url=url, name="codebase-memory-mcp")
+
     # Extract binary from tar.gz
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             for member in tar.getmembers():
                 if member.name.endswith(CBM_BIN_NAME) or member.name == CBM_BIN_NAME:
                     member.name = target_path.name
-                    tar.extract(member, CBM_BIN_DIR)
+                    tar.extract(member, CBM_BIN_DIR, filter="data")
                     break
             else:
                 raise RuntimeError("codebase-memory-mcp binary not found in archive")
@@ -95,13 +99,12 @@ def download_cbm(version: str | None = None) -> Path:
 
     # Verify
     try:
-        import subprocess
+        from headroom._subprocess import run
 
-        result = subprocess.run(
+        result = run(
             [str(target_path), "--version"],
             capture_output=True,
             text=True,
-            timeout=5,
         )
         if result.returncode == 0:
             ver = result.stdout.strip()

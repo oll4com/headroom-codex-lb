@@ -114,10 +114,12 @@ HeadroomStrandsModel supports Strands' structured output feature:
 ```python
 from pydantic import BaseModel
 
+
 class Analysis(BaseModel):
     severity: str
     root_cause: str
     recommendation: str
+
 
 result = optimized.structured_output(Analysis, messages)
 ```
@@ -160,7 +162,7 @@ HeadroomStrandsModel.stream()
 Provider API (Bedrock, etc.)
 ```
 
-The model wrapper uses Headroom's full pipeline (CacheAligner → ContentRouter → IntelligentContext). The hook provider uses SmartCrusher directly for fast JSON compression of individual tool results.
+The model wrapper uses Headroom's full pipeline (CacheAligner → ContentRouter). The hook provider uses SmartCrusher directly for fast JSON compression of individual tool results.
 
 ---
 

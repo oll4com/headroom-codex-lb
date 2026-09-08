@@ -6,7 +6,17 @@ Get Headroom running in 5 minutes with these copy-paste examples.
 
 ## Installation
 
-**Python:**
+**CLI on macOS Apple Silicon/Linux with uv:**
+
+```bash
+uv tool install --python 3.13 "headroom-ai[all]"
+headroom --version
+```
+
+Use `uv tool update-shell` if the install succeeds but `headroom` is not on
+`PATH`.
+
+**Python project / virtualenv:**
 
 ```bash
 # Core only (minimal dependencies)
@@ -139,19 +149,21 @@ messages = [
     {
         "role": "assistant",
         "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q": "python"}'},
-        }],
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "python"}'},
+            }
+        ],
     },
     {
         "role": "tool",
         "tool_call_id": "call_1",
         # This is where Headroom shines - compressing large outputs
-        "content": json.dumps({
-            "results": [{"title": f"Result {i}", "score": 100-i} for i in range(500)]
-        }),
+        "content": json.dumps(
+            {"results": [{"title": f"Result {i}", "score": 100 - i} for i in range(500)]}
+        ),
     },
     {"role": "user", "content": "What are the top 3 results?"},
 ]
@@ -178,7 +190,9 @@ plan = client.chat.completions.simulate(
 
 print(f"Tokens before: {plan.tokens_before}")
 print(f"Tokens after: {plan.tokens_after}")
-print(f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved/plan.tokens_before*100:.0f}%)")
+print(
+    f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved / plan.tokens_before * 100:.0f}%)"
+)
 print(f"Transforms: {plan.transforms}")
 print(f"Estimated savings: {plan.estimated_savings}")
 ```
@@ -217,6 +231,7 @@ print(response.content[0].text)
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.INFO)
 
 # Now you'll see:
@@ -319,7 +334,7 @@ response = client.chat.completions.create(
 
 ## Next Steps
 
-- **[Configuration Reference](api.md)** - All configuration options
+- **[Configuration Reference](configuration.md)** - All configuration options
 - **[Transform Reference](transforms.md)** - How each transform works
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
 - **[Examples](../examples/)** - More complete examples
@@ -337,6 +352,7 @@ print(stats["config"]["mode"])  # Should be "optimize"
 
 # 2. Enable logging to see what's happening
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 ```
 

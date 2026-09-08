@@ -11,6 +11,16 @@ from headroom.ccr import (
 )
 
 
+class _AlwaysOwnStore:
+    """Stub compression store for verify_ownership() (issue #2836) in tests
+    that only exercise injection plumbing with hand-typed marker hashes,
+    not real CompressionStore-backed storage.
+    """
+
+    def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
+        return True
+
+
 class TestCCRToolDefinition:
     """Test tool definition creation for different providers."""
 
@@ -23,7 +33,8 @@ class TestCCRToolDefinition:
         assert "input_schema" in tool
         assert tool["input_schema"]["type"] == "object"
         assert "hash" in tool["input_schema"]["properties"]
-        assert "query" in tool["input_schema"]["properties"]
+        # Retrieval is by hash only — no query/search parameter.
+        assert "query" not in tool["input_schema"]["properties"]
         assert tool["input_schema"]["required"] == ["hash"]
 
     def test_openai_format(self):
@@ -63,6 +74,28 @@ class TestCCRToolInjector:
 
         assert len(hashes) == 1
         assert "abc123def456abc123def456" in hashes
+        assert injector.has_compressed_content
+
+    def test_scan_detects_read_lifecycle_stale_marker(self):
+        """A read_lifecycle STALE marker carries a retrievable CCR hash via the
+        'Retrieve original: hash=' phrase but never says 'compressed', so the
+        other patterns miss it. The injector must still detect it, or the
+        retrieve tool is not offered and the marker is unredeemable (#1006)."""
+        ccr_hash = "a1b2c3d4e5f6a1b2c3d4e5f6"  # 24 hex chars (SHA-256[:24])
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    "[Read content stale: app.py was modified after this read — "
+                    f"re-read the file for current content. Retrieve original: hash={ccr_hash}]"
+                ),
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert ccr_hash in hashes
         assert injector.has_compressed_content
 
     def test_scan_for_markers_multiple_hashes(self):
@@ -248,6 +281,10 @@ class TestCCRToolInjector:
             provider="anthropic",
             inject_tool=True,
             inject_system_instructions=True,
+            # verify_ownership() (issue #2836) requires the store to
+            # recognize the hash; this test only exercises injection
+            # plumbing, not real storage, so stub ownership as always-true.
+            compression_store=_AlwaysOwnStore(),
         )
         updated_messages, updated_tools, was_injected = injector.process_request(messages, None)
 
@@ -266,13 +303,12 @@ class TestParseToolCall:
         tool_call = {
             "id": "toolu_123",
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "abc123def456abc123def456", "query": "errors"},
+            "input": {"hash": "abc123def456abc123def456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "abc123def456abc123def456"
-        assert query == "errors"
 
     def test_parse_openai_format(self):
         """Parse OpenAI tool call format."""
@@ -280,14 +316,32 @@ class TestParseToolCall:
             "id": "call_123",
             "function": {
                 "name": CCR_TOOL_NAME,
-                "arguments": json.dumps({"hash": "def456abc123def456abc123", "query": None}),
+                "arguments": json.dumps({"hash": "def456abc123def456abc123"}),
             },
         }
 
-        hash_key, query = parse_tool_call(tool_call, "openai")
+        hash_key = parse_tool_call(tool_call, "openai")
 
         assert hash_key == "def456abc123def456abc123"
-        assert query is None
+
+    def test_parse_null_function_returns_none_without_crashing(self):
+        """A tool call with an explicit {"function": null} / {"functionCall": null}
+        must return None, not raise AttributeError."""
+        assert parse_tool_call({"id": "c1", "function": None}, "openai") is None
+        assert parse_tool_call({"functionCall": None}, "google") is None
+
+    def test_parse_normalises_uppercase_hash_to_lowercase(self):
+        """An uppercase hash echoed by the model must be lowercased so it
+        matches the store (which keys entries by a lowercase hash)."""
+        tool_call = {
+            "id": "toolu_123",
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "ABC123DEF456ABC123DEF456"},
+        }
+
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
 
     def test_parse_non_ccr_tool(self):
         """Returns None for non-CCR tool calls."""
@@ -296,10 +350,9 @@ class TestParseToolCall:
             "input": {"param": "value"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key is None
-        assert query is None
 
     def test_parse_malformed_openai_args(self):
         """Handles malformed JSON in OpenAI arguments."""
@@ -311,16 +364,34 @@ class TestParseToolCall:
             },
         }
 
-        hash_key, query = parse_tool_call(tool_call, "openai")
+        hash_key = parse_tool_call(tool_call, "openai")
 
         assert hash_key is None
+
+    def test_parse_openai_non_object_arguments_returns_none(self):
+        """OpenAI arguments that decode to a non-object (array/string/number)
+        must return None, not crash on `.get`."""
+        for args in ("[]", '"abc"', "123"):
+            tool_call = {"function": {"name": CCR_TOOL_NAME, "arguments": args}}
+            assert parse_tool_call(tool_call, "openai") is None
+
+    def test_parse_openai_null_arguments_returns_none(self):
+        """A null `arguments` value (json.loads(None) -> TypeError) is handled."""
+        tool_call = {"function": {"name": CCR_TOOL_NAME, "arguments": None}}
+        assert parse_tool_call(tool_call, "openai") is None
+
+    def test_parse_anthropic_non_dict_input_returns_none(self):
+        """A non-dict Anthropic `input` must return None, not crash."""
+        tool_call = {"name": CCR_TOOL_NAME, "input": ["not", "a", "dict"]}
+        assert parse_tool_call(tool_call, "anthropic") is None
 
 
 class TestHashSecurityValidation:
     """Test hash validation security measures.
 
-    CCR hashes must be exactly 24 hex characters (96 bits of SHA256).
-    This prevents hash spoofing attacks with shorter or malformed hashes.
+    CCR hashes are 12 hex chars (SmartCrusher) or 24 hex chars (legacy
+    bracket markers / compression_store). Any other length or non-hex input
+    is rejected to prevent hash spoofing with malformed hashes.
     """
 
     def test_rejects_short_hash(self):
@@ -330,7 +401,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123"},  # Only 6 chars
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_rejects_long_hash(self):
@@ -340,7 +411,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456abc123"},  # 30 chars
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_rejects_non_hex_characters(self):
@@ -350,7 +421,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123xyz456abc123xyz456"},  # Contains xyz
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_accepts_valid_24_char_hash(self):
@@ -360,7 +431,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key == "abc123def456abc123def456"
 
     def test_accepts_uppercase_hex(self):
@@ -370,9 +441,85 @@ class TestHashSecurityValidation:
             "input": {"hash": "ABC123DEF456ABC123DEF456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         # Note: validation accepts uppercase since we use .lower() for hex check
-        assert hash_key == "ABC123DEF456ABC123DEF456"
+        assert hash_key == "abc123def456abc123def456"
+
+
+class TestSmartCrusherCcrMarkers:
+    """Regression tests for issue #1095.
+
+    SmartCrusher emits 12-hex-char hashes inside ``<<ccr:HASH ...>>`` markers
+    (the row-drop summary and the opaque-blob form). The injector must detect
+    those markers and ``parse_tool_call`` must accept the 12-char hashes —
+    previously both only recognized the 24-char legacy bracket markers.
+    """
+
+    def test_scan_detects_row_drop_marker(self):
+        """Detects ``<<ccr:HASH N_rows_offloaded>>`` (12-char hash)."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "x",
+                        "content": '{"kept": 12, "ccr": "<<ccr:e21a26620105 988_rows_offloaded>>"}',
+                    }
+                ],
+            }
+        ]
+
+        injector = CCRToolInjector(provider="anthropic")
+        hashes = injector.scan_for_markers(messages)
+
+        assert hashes == ["e21a26620105"]
+        assert injector.has_compressed_content
+
+    def test_scan_detects_opaque_blob_marker(self):
+        """Detects the ``<<ccr:HASH,KIND,SIZE>>`` opaque-blob form."""
+        messages = [
+            {"role": "tool", "content": "<<ccr:deadbeefdead,string,2.3KB>>"},
+        ]
+
+        hashes = CCRToolInjector().scan_for_markers(messages)
+
+        assert hashes == ["deadbeefdead"]
+
+    def test_legacy_bracket_marker_still_detected(self):
+        """The 24-char legacy bracket marker keeps working alongside the new one."""
+        messages = [
+            {
+                "role": "tool",
+                "content": "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]",
+            },
+        ]
+
+        hashes = CCRToolInjector().scan_for_markers(messages)
+
+        assert hashes == ["abc123def456abc123def456"]
+
+    def test_parse_tool_call_accepts_12_char_hash(self):
+        """``parse_tool_call`` accepts a 12-char SmartCrusher hash."""
+        tool_call = {
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "e21a26620105"},
+        }
+
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "e21a26620105"
+
+    def test_parse_tool_call_still_accepts_24_char_hash(self):
+        """24-char legacy hashes remain valid (regression guard)."""
+        tool_call = {
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "abc123def456abc123def456"},
+        }
+
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSystemInstructions:
@@ -487,3 +634,164 @@ class TestAlternativeMarkerFormats:
 
         assert len(hashes) == 1
         assert "fedcba9876543210fedcba98" in hashes
+
+
+class TestVerifyOwnership:
+    """Regression tests for issue #2836.
+
+    Shape-only marker scanning (``scan_for_markers``) matches markers from
+    ANY context tool that happens to use the same bracket format, not just
+    Headroom's own. ``verify_ownership`` closes that gap by checking each
+    detected hash against the actual compression store before it can drive
+    retrieve-tool injection.
+    """
+
+    def test_foreign_marker_is_dropped(self):
+        """The exact repro from issue #2836: a marker Headroom never
+        created must not be adopted, even though its shape matches.
+        """
+        from headroom.cache.compression_store import reset_compression_store
+
+        reset_compression_store()
+        try:
+            foreign = (
+                "[374 items compressed to 267 (from 65 source lines). "
+                "Retrieve more: hash=ddc3d69afad7bc53fbee11e2]"
+            )
+            injector = CCRToolInjector(provider="anthropic")
+            injector.scan_for_markers([{"role": "user", "content": foreign}])
+
+            # Shape-only scan still finds it — that's the bug surface.
+            assert injector.detected_hashes == ["ddc3d69afad7bc53fbee11e2"]
+
+            injector.verify_ownership()
+
+            assert injector.detected_hashes == []
+            assert injector.has_compressed_content is False
+        finally:
+            reset_compression_store()
+
+    def test_real_hash_survives_verification(self):
+        """A hash Headroom actually stored must still be recognized."""
+        from headroom.cache.compression_store import (
+            get_compression_store,
+            reset_compression_store,
+        )
+
+        reset_compression_store()
+        try:
+            store = get_compression_store()
+            real_hash = store.store(
+                original="original content",
+                compressed="compressed content",
+                explicit_hash="abc123def456abc123def456",
+            )
+
+            marker = f"[100 items compressed to 10. Retrieve more: hash={real_hash}]"
+            injector = CCRToolInjector(provider="anthropic")
+            injector.scan_for_markers([{"role": "user", "content": marker}])
+            injector.verify_ownership()
+
+            assert injector.detected_hashes == [real_hash]
+            assert injector.has_compressed_content is True
+        finally:
+            reset_compression_store()
+
+    def test_mixed_own_and_foreign_hashes_keeps_only_own(self):
+        """One own hash and one foreign hash in the same scan — only the
+        own hash survives verification.
+        """
+        from headroom.cache.compression_store import (
+            get_compression_store,
+            reset_compression_store,
+        )
+
+        reset_compression_store()
+        try:
+            store = get_compression_store()
+            store.store(
+                original="mine",
+                compressed="mine-compressed",
+                explicit_hash="111111111111111111111111",
+            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "[10 items compressed to 5. Retrieve more: hash=111111111111111111111111]"
+                        "\n[20 items compressed to 8. Retrieve more: hash=222222222222222222222222]"
+                    ),
+                }
+            ]
+            injector = CCRToolInjector(provider="anthropic")
+            injector.scan_for_markers(messages)
+            assert set(injector.detected_hashes) == {
+                "111111111111111111111111",
+                "222222222222222222222222",
+            }
+
+            injector.verify_ownership()
+
+            assert injector.detected_hashes == ["111111111111111111111111"]
+        finally:
+            reset_compression_store()
+
+    def test_explicit_store_takes_precedence_over_global(self):
+        """A store passed to verify_ownership() overrides the default
+        (global/request-scoped) resolution — matches the constructor's
+        compression_store field too.
+        """
+
+        class _NeverOwnStore:
+            def exists(self, hash_key, clean_expired=False):  # noqa: ANN001
+                return False
+
+        injector = CCRToolInjector(provider="anthropic", compression_store=_NeverOwnStore())
+        injector.scan_for_markers(
+            [
+                {
+                    "role": "user",
+                    "content": "[1 items compressed to 1. Retrieve more: hash=abcabcabcabcabcabcabcabc]",
+                }
+            ]
+        )
+        injector.verify_ownership()
+
+        assert injector.detected_hashes == []
+
+    def test_store_lookup_exception_is_treated_as_not_owned(self):
+        """A store lookup failure must not crash CCR verification — it
+        should drop the marker (the safe direction), not raise.
+        """
+
+        class _BrokenStore:
+            def exists(self, hash_key, clean_expired=False):  # noqa: ANN001
+                raise RuntimeError("store backend unavailable")
+
+        injector = CCRToolInjector(provider="anthropic", compression_store=_BrokenStore())
+        injector.scan_for_markers(
+            [
+                {
+                    "role": "user",
+                    "content": "[1 items compressed to 1. Retrieve more: hash=abcabcabcabcabcabcabcabc]",
+                }
+            ]
+        )
+        injector.verify_ownership()  # must not raise
+
+        assert injector.detected_hashes == []
+
+    def test_verify_ownership_is_noop_on_empty_hashes(self):
+        """No detected hashes -> verify_ownership must not touch the store
+        at all (nothing to verify).
+        """
+
+        class _ExplodingStore:
+            def exists(self, hash_key, clean_expired=False):  # noqa: ANN001
+                raise AssertionError("should not be called with no detected hashes")
+
+        injector = CCRToolInjector(provider="anthropic", compression_store=_ExplodingStore())
+        injector.scan_for_markers([{"role": "user", "content": "no markers here"}])
+        result = injector.verify_ownership()
+
+        assert result == []

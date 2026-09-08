@@ -106,8 +106,14 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
         return projects
 
-    def scan_project(self, project: ProjectInfo, max_workers: int = 1) -> list[SessionData]:
-        """Scan all Gemini session files for a project."""
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all Gemini session files for a project.
+
+        ``include_subagents`` is accepted for a uniform plugin contract but is a
+        no-op: Gemini stores sessions flat, with no nested transcript hierarchy.
+        """
         session_files = sorted(project.data_path.glob("session-*.json")) + sorted(
             project.data_path.glob("session-*.jsonl")
         )
@@ -137,7 +143,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
     def _scan_json_session(self, json_path: Path) -> SessionData | None:
         """Parse a Gemini JSON session file."""
         try:
-            with open(json_path) as f:
+            with open(json_path, encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.debug("Failed to read Gemini session %s: %s", json_path, e)
@@ -161,7 +167,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
         messages: list[dict] = []
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
@@ -210,14 +216,15 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
             usage = msg.get("usageMetadata", msg.get("usage", {}))
             if isinstance(usage, dict):
+                # Gemini's promptTokenCount is the FULL input token count and
+                # cachedContentTokenCount is the cached SUBSET of it, so adding
+                # both double-counts the cached input. Likewise totalTokenCount
+                # == promptTokenCount + candidatesTokenCount, so
+                # (totalTokenCount - promptTokenCount) is just candidatesTokenCount
+                # again — adding it on top double-counts the output. Count the
+                # prompt as input and the candidates as output, once each.
                 total_input_tokens += usage.get("promptTokenCount", 0)
-                total_input_tokens += usage.get("cachedContentTokenCount", 0)
                 total_output_tokens += usage.get("candidatesTokenCount", 0)
-                total_output_tokens += (
-                    usage.get("totalTokenCount", 0) - usage.get("promptTokenCount", 0)
-                    if usage.get("totalTokenCount")
-                    else 0
-                )
 
             if not isinstance(parts, list):
                 continue
@@ -306,21 +313,54 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
         )
 
     def _detect_project_path(self, session_path: Path) -> Path | None:
-        """Try to detect the project path from a session file."""
+        """Try to detect the project path from a session file (JSON or JSONL)."""
+        # A `.jsonl` session is a stream of one JSON object per line, so
+        # `json.load` on the whole file raises JSONDecodeError on the second
+        # line and detection silently fell back to cwd — writing the learned
+        # insights to the wrong project and missing its GEMINI.md. Read JSONL
+        # line-by-line like the sibling `_scan_jsonl_session` (and the Claude
+        # plugin's `_project_path_from_session_cwd`) do.
+        if session_path.suffix == ".jsonl":
+            return self._detect_project_path_jsonl(session_path)
+
         try:
-            with open(session_path) as f:
+            with open(session_path, encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None
 
         if isinstance(data, dict):
-            project_path = data.get("projectPath", data.get("project_path", ""))
-            if project_path and Path(project_path).exists():
-                return Path(project_path)
-            cwd = data.get("cwd", data.get("workingDirectory", ""))
-            if cwd and Path(cwd).exists():
-                return Path(cwd)
+            return self._project_path_from_entry(data)
 
+        return None
+
+    def _detect_project_path_jsonl(self, session_path: Path) -> Path | None:
+        try:
+            with open(session_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    found = self._project_path_from_entry(entry)
+                    if found is not None:
+                        return found
+        except (OSError, UnicodeDecodeError):
+            return None
+        return None
+
+    @staticmethod
+    def _project_path_from_entry(entry: dict) -> Path | None:
+        project_path = entry.get("projectPath", entry.get("project_path", ""))
+        if project_path and Path(project_path).exists():
+            return Path(project_path)
+        cwd = entry.get("cwd", entry.get("workingDirectory", ""))
+        if cwd and Path(cwd).exists():
+            return Path(cwd)
         return None
 
 

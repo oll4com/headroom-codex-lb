@@ -22,6 +22,10 @@ def resolve_provider_type(
         return provider_type
 
     env = environ or os.environ
+    # Check COPILOT_PROVIDER_TYPE env var before falling back to backend default.
+    env_type = env.get("COPILOT_PROVIDER_TYPE")
+    if env_type in {"anthropic", "openai"}:
+        return env_type
     effective_backend = backend or env.get("HEADROOM_BACKEND") or "anthropic"
     return "anthropic" if effective_backend == "anthropic" else "openai"
 
@@ -67,6 +71,49 @@ def validate_configuration(
         )
 
 
+#: Copilot virtual model names that map to native auto-routing.
+#: Forwarding these to BYOK endpoints causes a 400; they must be stripped.
+_AUTO_MODEL_ALIASES: frozenset[str] = frozenset({"auto"})
+
+
+def is_auto_model(model: str | None) -> bool:
+    """Return True when the model name is a Copilot auto-routing alias.
+
+    ``model auto`` is a virtual model ID that Copilot resolves internally.
+    It is **not** a valid model string for BYOK providers (Anthropic, OpenAI)
+    and causes a ``400 The requested model is not supported`` error if forwarded
+    verbatim.  This helper centralises the detection so both the CLI and the
+    proxy layer can guard against it.
+    """
+    if not model:
+        return False
+    return model.strip().lower() in _AUTO_MODEL_ALIASES
+
+
+def strip_auto_model_args(copilot_args: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove ``--model auto`` (and ``--model=auto``) from Copilot CLI args.
+
+    Used in the subscription/OAuth path: when the user passes ``--model auto``
+    to ``headroom wrap copilot --subscription``, we strip it before launching
+    Copilot so the CLI falls back to its own native automatic model selection
+    instead of sending the unsupported ``auto`` string to the BYOK API.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(copilot_args):
+        arg = copilot_args[i]
+        if arg == "--model" and i + 1 < len(copilot_args):
+            if is_auto_model(copilot_args[i + 1]):
+                i += 2  # skip both --model and auto
+                continue
+        elif arg.startswith("--model=") and is_auto_model(arg.split("=", 1)[1]):
+            i += 1  # skip --model=auto
+            continue
+        result.append(arg)
+        i += 1
+    return tuple(result)
+
+
 def _normalized_model_name(model: str | None) -> str:
     """Return a lowercase model name without provider/path prefixes."""
     if not model:
@@ -107,6 +154,73 @@ def default_wire_api_for_model(model: str | None) -> str:
 def provider_key_source(provider_type: str) -> str:
     """Return the preferred provider key variable for the selected provider type."""
     return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
+
+
+COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
+
+# Any survivor keeps Copilot in its single-model BYOK lane, defeating native
+# model routing while making the launch look superficially successful.
+COPILOT_BYOK_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_PROVIDER_BASE_URL",
+    "COPILOT_PROVIDER_TYPE",
+    "COPILOT_PROVIDER_API_KEY",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_WIRE_API",
+    "COPILOT_PROVIDER_TRANSPORT",
+    "COPILOT_PROVIDER_AZURE_API_VERSION",
+    "COPILOT_PROVIDER_MODEL_ID",
+    "COPILOT_PROVIDER_WIRE_MODEL",
+    "COPILOT_PROVIDER_MODEL_LIMITS_ID",
+    "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+    "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+    "COPILOT_PROVIDER_HEADERS",
+)
+
+
+def build_native_launch_env(
+    *,
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    project: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Redirect Copilot's native API surface through Headroom, not BYOK."""
+    env = dict(environ if environ is not None else os.environ)
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
+    env[COPILOT_NATIVE_API_URL_ENV] = base_url
+    for variable in COPILOT_BYOK_ENV_VARS:
+        env.pop(variable, None)
+    return env, [
+        f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
+        "COPILOT_AUTH_MODE=github-native",
+    ]
+
+
+def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    """Best-effort tri-state probe for the CLI's native API URL override."""
+    env = environ if environ is not None else os.environ
+    local = env.get("LOCALAPPDATA") or env.get("HOME") or os.path.expanduser("~")
+    roots = (
+        os.path.join(local, "copilot", "pkg"),
+        os.path.join(os.path.expanduser("~"), ".local", "share", "copilot", "pkg"),
+    )
+    found_bundle = False
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if "app.js" not in filenames:
+                continue
+            found_bundle = True
+            try:
+                with open(
+                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
+                ) as bundle:
+                    while chunk := bundle.read(1 << 20):
+                        if COPILOT_NATIVE_API_URL_ENV in chunk:
+                            return True
+            except OSError:
+                continue
+    return False if found_bundle else None
 
 
 def build_launch_env(
@@ -156,14 +270,15 @@ def build_launch_env(
 
 
 def model_configured(copilot_args: tuple[str, ...], env: Mapping[str, str]) -> bool:
-    """Return True when Copilot BYOK model selection is configured."""
-    if env.get("COPILOT_MODEL") or env.get("COPILOT_PROVIDER_MODEL_ID"):
-        return True
+    """Return True when Copilot BYOK model selection is configured (non-auto).
 
-    for idx, arg in enumerate(copilot_args):
-        if arg == "--model" and idx + 1 < len(copilot_args):
-            return True
-        if arg.startswith("--model="):
-            return True
-
-    return False
+    ``--model auto`` is **not** considered configured for BYOK purposes: it is
+    a virtual Copilot routing token that has no meaning to external providers
+    such as Anthropic or OpenAI, and forwarding it causes a 400.  Returning
+    ``False`` here ensures the BYOK "model required" warning is still shown
+    when the user mistakenly passes ``--model auto`` in BYOK mode.
+    """
+    model = copilot_model_from_args(copilot_args, env)
+    if model is None or is_auto_model(model):
+        return False
+    return True

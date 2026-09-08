@@ -25,6 +25,11 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
 # Add repo root to sys.path so the harness import works whether the file is
 # invoked as ``python e2e/init/run.py`` or ``python -m e2e.init.run``.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -38,12 +43,37 @@ from e2e._lib import (  # noqa: E402
     run_cases,
 )
 from headroom.cli import init as init_cli  # noqa: E402
+from headroom.install.runtime import resolve_headroom_command  # noqa: E402
 
 # ----- helpers reused across cases --------------------------------------------
 
 # Docker image builds the workspace at /workspace; the marketplace source
 # falls back to that repo checkout when a local marketplace manifest is found.
 REPO_ROOT_IN_CONTAINER = Path("/workspace")
+
+
+def _expected_headroom_mcp_calls(proxy_url: str) -> list[list[str]]:
+    # The harness restores PATH before assertions, but `headroom init` ran with a
+    # scrubbed PATH where the console-script entrypoint may be unavailable.
+    prefix = [
+        "mcp",
+        "add",
+        "headroom",
+        "-s",
+        "user",
+        "-e",
+        f"HEADROOM_PROXY_URL={proxy_url}",
+        "--",
+    ]
+    variants = [
+        [*prefix, *resolve_headroom_command(), "mcp", "serve"],
+        [*prefix, sys.executable, "-m", "headroom.cli", "mcp", "serve"],
+    ]
+    deduped: list[list[str]] = []
+    for variant in variants:
+        if variant not in deduped:
+            deduped.append(variant)
+    return deduped
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -64,6 +94,15 @@ def _read_manifest(home: Path, profile: str) -> dict[str, object]:
     if not path.exists():
         raise AssertionError(f"Expected manifest at {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _expect_codex_hooks_feature(config: str) -> None:
+    parsed = tomllib.loads(config)
+    features = parsed.get("features")
+    if not isinstance(features, dict) or features.get("hooks") is not True:
+        raise AssertionError("Codex config should enable hooks")
+    if "codex_hooks" in features:
+        raise AssertionError("Codex config should not keep deprecated codex_hooks")
 
 
 # ----- existing-flow assertions (ported verbatim from the old run.py) ---------
@@ -97,24 +136,16 @@ def _verify_claude_local(ctx: CaseContext) -> None:
     # being dead pointers for users who never ran `headroom mcp install`).
     # The `-e HEADROOM_PROXY_URL=…` arg is only emitted when the proxy
     # port differs from the 8787 default; this case uses --port 9011.
-    expected = [
+    expected_prefix = [
         ["plugin", "marketplace", "add", str(REPO_ROOT_IN_CONTAINER)],
         ["plugin", "install", "headroom@headroom-marketplace", "--scope", "local"],
-        [
-            "mcp",
-            "add",
-            "headroom",
-            "-s",
-            "user",
-            "-e",
-            "HEADROOM_PROXY_URL=http://127.0.0.1:9011",
-            "--",
-            "headroom",
-            "mcp",
-            "serve",
-        ],
     ]
-    if claude_calls != expected:
+    expected_mcp_calls = _expected_headroom_mcp_calls("http://127.0.0.1:9011")
+    if (
+        len(claude_calls) != 3
+        or claude_calls[:2] != expected_prefix
+        or claude_calls[2] not in expected_mcp_calls
+    ):
         raise AssertionError(f"Unexpected Claude install commands: {claude_calls}")
 
 
@@ -166,8 +197,7 @@ def _verify_codex_local(ctx: CaseContext) -> None:
         raise AssertionError("Codex local init missing 'supports_websockets = true'")
     if config.count("[features]") != 1:
         raise AssertionError("Codex config should keep a single [features] table")
-    if "codex_hooks = true" not in config:
-        raise AssertionError("Codex config should enable codex_hooks")
+    _expect_codex_hooks_feature(config)
     command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     _expect_hook_command(command, profile)
 
@@ -206,8 +236,7 @@ def _verify_codex_global(ctx: CaseContext) -> None:
         )
     if "supports_websockets = true" not in config:
         raise AssertionError("Codex global init missing 'supports_websockets = true'")
-    if "codex_hooks = true" not in config:
-        raise AssertionError("Codex user config should enable codex_hooks")
+    _expect_codex_hooks_feature(config)
     hooks = json.loads((ctx.home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     _expect_hook_command(
         hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
