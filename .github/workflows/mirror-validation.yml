@@ -3,19 +3,93 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft]
 permissions:
   contents: read
+  pull-requests: read
+concurrency:
+  group: mirror-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  validate:
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: python -m compileall -q headroom
       - name: Check mirror boundaries
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           test -f LICENSE
           test -f OLL4_CHANGELOG.md
-          git diff --check
+          test -f UPSTREAM_README.md
+          git diff --stat "$BASE_SHA"...HEAD
+          git diff --check "$BASE_SHA"...HEAD
+      - name: Protect upstream changelog
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --exit-code "$BASE_SHA"...HEAD -- CHANGELOG.md
+
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.json
+
+  # Retain the required context, but validate label decisions without write access.
+  label:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Read current PR metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" \
+            --jq '{pull_request: .}' > "$RUNNER_TEMP/pr-event.json"
+      - name: Validate review readiness and label decisions
+        run: |
+          python scripts/pr-governance.py \
+            --event "$RUNNER_TEMP/pr-event.json" \
+            --report "$RUNNER_TEMP/pr-governance-report.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "pr-governance-report.json").read_text()
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(report["summary_markdown"] + "\n")
+              summary.write("\nSuggested labels: " + ", ".join(report["labels_to_add"]) + "\n")
+          if not report["valid"]:
+              raise SystemExit("PR governance failed; see the job summary.")
+          PY
