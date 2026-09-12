@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - run: python -m compileall -q headroom
@@ -63,7 +63,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Read current PR metadata
