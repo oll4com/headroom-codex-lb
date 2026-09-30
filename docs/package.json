@@ -41,7 +41,7 @@
 		"openai": "^6.47.0",
 		"postcss": "^8.5.26",
 		"tailwindcss": "^4.2.2",
-		"typescript": "^5.9.3"
+		"typescript": "^7.0.2"
 	},
 	"overrides": {
 		"postcss": "$postcss"
